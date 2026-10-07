@@ -65,7 +65,7 @@ HTML = '''
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Bharat24Tools API v8.4</title>
+    <title>Bharat24Tools API v8.5</title>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <style>
         * { margin:0; padding:0; box-sizing:border-box; font-family:Arial,sans-serif; }
@@ -82,7 +82,7 @@ HTML = '''
 </head>
 <body>
     <div class="container">
-        <h1>⚡ Bharat24Tools API v8.4</h1>
+        <h1>⚡ Bharat24Tools API v8.5</h1>
         <p class="status-badge">Server is running ✅ — 22 Tools Active</p>
 
         <div class="section-title">📄 PDF Tools (13)</div>
@@ -91,7 +91,7 @@ HTML = '''
         <div class="endpoint"><code>POST /jpg-to-pdf</code><span class="desc">Images to PDF ✅ FIXED</span></div>
         <div class="endpoint"><code>POST /pdf-to-word</code><span class="desc">PDF to Word</span></div>
         <div class="endpoint"><code>POST /word-to-pdf</code><span class="desc">Word to PDF</span></div>
-        <div class="endpoint"><code>POST /excel-to-pdf</code><span class="desc">Excel to PDF ✅ PANDAS + 15MB</span></div>
+        <div class="endpoint"><code>POST /excel-to-pdf</code><span class="desc">Excel to PDF ✅ 15MB + Robust</span></div>
         <div class="endpoint"><code>POST /pdf-to-excel</code><span class="desc">PDF to Excel</span></div>
         <div class="endpoint"><code>POST /excel-to-image</code><span class="desc">Excel to Image</span></div>
         <div class="endpoint"><code>POST /merge-pdf</code><span class="desc">Merge PDFs</span></div>
@@ -111,7 +111,7 @@ HTML = '''
         <div class="endpoint"><code>POST /pdf-watermark</code><span class="desc">PDF Watermark</span></div>
         <div class="endpoint"><code>POST /pdf-page-delete</code><span class="desc">PDF Page Delete</span></div>
 
-        <p class="footer">Version 8.4 — 22 Tools Active | Excel to PDF with Pandas + 15MB Support</p>
+        <p class="footer">Version 8.5 — 22 Tools Active | Excel to PDF with Robust 15MB Support</p>
     </div>
 </body>
 </html>
@@ -156,11 +156,11 @@ def health():
     return {
         'status': 'ok',
         'service': 'bharat24tools-api',
-        'version': '8.4',
+        'version': '8.5',
         'tools': 22,
         'ghostscript': True,
         'auto_cleanup': True,
-        'excel_to_pdf': 'pandas-15mb',
+        'excel_to_pdf': 'robust-15mb',
         'background_remover': 'client-side'
     }
 
@@ -249,7 +249,7 @@ def pdf_to_jpg():
         cleanup_dir(temp_dir)
 
 
-# ========== 3. JPG TO PDF (Pillow — NO GHOSTSCRIPT) ✅ FIXED ==========
+# ========== 3. JPG TO PDF ==========
 @app.route('/jpg-to-pdf', methods=['POST'])
 def jpg_to_pdf():
     if not processing_lock.acquire(timeout=300):
@@ -411,7 +411,7 @@ def word_to_pdf():
         cleanup_dir(temp_dir)
 
 
-# ========== 6. EXCEL TO PDF (Pandas + 15MB — Best Row/Column Result) ==========
+# ========== 6. EXCEL TO PDF (Robust 15MB — Best Row/Column Result) ==========
 @app.route('/excel-to-pdf', methods=['POST'])
 def excel_to_pdf():
     if not processing_lock.acquire(timeout=300):
@@ -430,7 +430,6 @@ def excel_to_pdf():
         output_path = os.path.join(temp_dir, 'output.pdf')
         file.save(input_path)
 
-        import pandas as pd
         from openpyxl import load_workbook
         from reportlab.lib.pagesizes import A4, landscape
         from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
@@ -443,57 +442,67 @@ def excel_to_pdf():
         from reportlab.lib.enums import TA_CENTER, TA_LEFT
         from datetime import datetime
 
-        # ========== SMART AI HELPERS ==========
+        # ========== HELPERS ==========
+        def clean_cell(value):
+            if value is None:
+                return ''
+            try:
+                s = str(value)
+                if s.lower() == 'nan' or s.lower() == 'none':
+                    return ''
+                return s.strip()
+            except:
+                return ''
+
         def detect_column_type(values):
-            non_empty = [str(v).strip() for v in values if v is not None and str(v).strip() and str(v).lower() != 'nan']
+            non_empty = [v for v in values if v and str(v).strip()]
             if not non_empty:
                 return 'text'
             num_count = 0
             for v in non_empty:
-                clean = v.replace(',', '').replace('₹', '').replace('$', '').replace('%', '').strip()
+                clean = str(v).replace(',', '').replace('₹', '').replace('$', '').replace('%', '').strip()
                 try:
                     float(clean)
                     num_count += 1
                 except:
                     pass
             if num_count / len(non_empty) > 0.7:
-                if any('₹' in v or '$' in v for v in non_empty):
+                if any('₹' in str(v) or '$' in str(v) for v in non_empty):
                     return 'currency'
-                if any('%' in v for v in non_empty):
+                if any('%' in str(v) for v in non_empty):
                     return 'percent'
                 return 'number'
             date_pattern = re.compile(r'\d{1,4}[-/\.]\d{1,2}[-/\.]\d{1,4}')
-            date_count = sum(1 for v in non_empty if date_pattern.search(v))
+            date_count = sum(1 for v in non_empty if date_pattern.search(str(v)))
             if date_count / len(non_empty) > 0.6:
                 return 'date'
             return 'text'
 
-        def calculate_column_widths(df, max_cols=15):
+        def calculate_column_widths(table_data, max_cols=15):
+            if not table_data:
+                return []
             widths = []
-            for col_idx in range(min(len(df.columns), max_cols)):
+            for col_idx in range(min(len(table_data[0]), max_cols)):
                 max_len = 0
-                col_name = str(df.columns[col_idx])
-                max_len = max(max_len, len(col_name))
-                sample_values = df.iloc[:50, col_idx].dropna().astype(str).tolist()
-                for v in sample_values:
-                    max_len = max(max_len, len(v))
+                for row in table_data[:100]:
+                    if col_idx < len(row):
+                        cell_len = len(str(row[col_idx]) if row[col_idx] else '')
+                        max_len = max(max_len, cell_len)
                 if max_len <= 5:
                     w = 20 * mm
                 elif max_len <= 10:
                     w = 28 * mm
                 elif max_len <= 20:
                     w = 38 * mm
-                elif max_len <= 40:
-                    w = 55 * mm
+                elif max_len <= 35:
+                    w = 50 * mm
                 else:
-                    w = 70 * mm
+                    w = 65 * mm
                 widths.append(w)
             return widths
 
         def smart_truncate(text, max_len=50):
             text = str(text) if text is not None else ''
-            if text.lower() == 'nan':
-                return ''
             if len(text) > max_len:
                 return text[:max_len - 3] + '...'
             return text
@@ -504,33 +513,39 @@ def excel_to_pdf():
                     .replace('<', '&lt;')
                     .replace('>', '&gt;'))
 
-        # ========== LOAD EXCEL WITH PANDAS ==========
-        try:
-            all_sheets = pd.read_excel(input_path, sheet_name=None, header=0, dtype=str)
-            all_sheets = {name: df for name, df in all_sheets.items() if not df.empty}
-            print(f'✅ Pandas loaded {len(all_sheets)} sheets', flush=True)
-        except Exception as e:
-            print(f'⚠️ Pandas failed: {e}, trying openpyxl fallback', flush=True)
-            try:
-                wb = load_workbook(input_path, data_only=True, read_only=True)
-                all_sheets = {}
-                for sheet_name in wb.sheetnames:
-                    sheet = wb[sheet_name]
-                    data = []
-                    for row in sheet.iter_rows(values_only=True):
-                        if row and any(c is not None and str(c).strip() for c in row):
-                            data.append([str(c) if c is not None else '' for c in row])
-                    if data and len(data) > 1:
-                        df = pd.DataFrame(data[1:], columns=data[0])
-                        all_sheets[sheet_name] = df
-                wb.close()
-                print(f'✅ Openpyxl loaded {len(all_sheets)} sheets', flush=True)
-            except Exception as e2:
-                print(f'❌ Both failed: {e2}', flush=True)
-                return f'Cannot read Excel file. Try re-saving as .xlsx. Error: {str(e2)}', 400
+        # ========== LOAD EXCEL — 3 Fallback Modes ==========
+        wb = None
+        load_success = False
 
-        if not all_sheets:
-            return 'Excel file is empty', 400
+        # Try 1: read_only mode
+        try:
+            wb = load_workbook(input_path, data_only=True, read_only=True)
+            load_success = True
+            print('✅ Loaded read_only=True', flush=True)
+        except Exception as e1:
+            print(f'⚠️ read_only failed: {e1}', flush=True)
+
+        # Try 2: normal mode
+        if not load_success:
+            try:
+                wb = load_workbook(input_path, data_only=True, read_only=False)
+                load_success = True
+                print('✅ Loaded normal mode', flush=True)
+            except Exception as e2:
+                print(f'⚠️ normal failed: {e2}', flush=True)
+
+        # Try 3: keep_links=False
+        if not load_success:
+            try:
+                wb = load_workbook(input_path, data_only=True, read_only=True,
+                                   keep_vba=False, keep_links=False)
+                load_success = True
+                print('✅ Loaded keep_links=False', flush=True)
+            except Exception as e3:
+                print(f'❌ All modes failed: {e3}', flush=True)
+
+        if not load_success or wb is None:
+            return 'Cannot read this Excel file. Please open it in Excel/LibreOffice and save as new .xlsx file.', 400
 
         # ========== PDF SETUP ==========
         pdf = SimpleDocTemplate(
@@ -541,93 +556,79 @@ def excel_to_pdf():
             topMargin=25*mm,
             bottomMargin=18*mm,
             title='Excel to PDF - Bharat24Tools',
-            author='Bharat24Tools',
-            subject='Converted Excel Spreadsheet'
+            author='Bharat24Tools'
         )
 
         styles = getSampleStyleSheet()
 
         title_style = ParagraphStyle(
-            'BrandTitle',
-            parent=styles['Heading1'],
-            fontSize=18,
-            textColor=colors.HexColor('#a855f7'),
-            alignment=TA_LEFT,
-            spaceAfter=4,
-            fontName='Helvetica-Bold'
+            'BrandTitle', parent=styles['Heading1'],
+            fontSize=18, textColor=colors.HexColor('#a855f7'),
+            alignment=TA_LEFT, spaceAfter=4, fontName='Helvetica-Bold'
         )
         subtitle_style = ParagraphStyle(
-            'BrandSubtitle',
-            parent=styles['Normal'],
-            fontSize=9,
-            textColor=colors.HexColor('#666666'),
-            alignment=TA_LEFT,
-            spaceAfter=12,
-            fontName='Helvetica-Oblique'
+            'BrandSubtitle', parent=styles['Normal'],
+            fontSize=9, textColor=colors.HexColor('#666666'),
+            alignment=TA_LEFT, spaceAfter=12, fontName='Helvetica-Oblique'
         )
         sheet_style = ParagraphStyle(
-            'SheetTitle',
-            parent=styles['Heading2'],
-            fontSize=13,
-            textColor=colors.HexColor('#533483'),
-            spaceBefore=8,
-            spaceAfter=8,
-            fontName='Helvetica-Bold'
+            'SheetTitle', parent=styles['Heading2'],
+            fontSize=13, textColor=colors.HexColor('#533483'),
+            spaceBefore=8, spaceAfter=8, fontName='Helvetica-Bold'
         )
 
         story = []
-
-        # ========== HEADER ==========
         story.append(Paragraph('⚡ Bharat24Tools', title_style))
         story.append(Paragraph(
-            f'Excel to PDF Converter &nbsp;•&nbsp; File: {escape_xml(file.filename)} &nbsp;•&nbsp; '
-            f'Converted: {datetime.now().strftime("%d %b %Y, %I:%M %p")}',
+            f'Excel to PDF &nbsp;•&nbsp; File: {escape_xml(file.filename)} &nbsp;•&nbsp; '
+            f'{datetime.now().strftime("%d %b %Y, %I:%M %p")}',
             subtitle_style
         ))
         story.append(Spacer(1, 6))
 
         total_rows_converted = 0
-        total_sheets = len(all_sheets)
         MAX_ROWS_PER_SHEET = 5000
+        MAX_COLS = 15
+        total_sheets = len(wb.sheetnames)
 
         # ========== PROCESS EACH SHEET ==========
-        for sheet_idx, (sheet_name, df) in enumerate(all_sheets.items()):
-            if len(df) > MAX_ROWS_PER_SHEET:
-                df = df.head(MAX_ROWS_PER_SHEET)
-                print(f'⚠️ Sheet {sheet_name} truncated to {MAX_ROWS_PER_SHEET} rows', flush=True)
-
-            # Clean column names
-            new_cols = []
-            for i, c in enumerate(df.columns):
-                c_str = str(c).strip()
-                if c_str.startswith('Unnamed') or c_str == 'nan' or c_str == '':
-                    new_cols.append(f'Column {i+1}')
-                else:
-                    new_cols.append(c_str)
-            df.columns = new_cols
-
-            # Limit columns
-            if len(df.columns) > 15:
-                df = df.iloc[:, :15]
-
-            # Build table data
-            table_data = []
-            table_data.append([str(c) for c in df.columns])
-
-            for _, row in df.iterrows():
-                cleaned_row = [smart_truncate(v, 50) for v in row.tolist()]
-                table_data.append(cleaned_row)
-
-            if len(table_data) < 2:
+        for sheet_idx, sheet_name in enumerate(wb.sheetnames):
+            try:
+                sheet = wb[sheet_name]
+            except Exception as e:
+                print(f'⚠️ Cannot access {sheet_name}: {e}', flush=True)
                 continue
 
-            # Detect column types
+            raw_data = []
+            try:
+                for row in sheet.iter_rows(values_only=True):
+                    if row is None:
+                        continue
+                    try:
+                        cleaned = [clean_cell(c) for c in row[:MAX_COLS]]
+                        if any(c for c in cleaned):
+                            raw_data.append(cleaned)
+                            if len(raw_data) >= MAX_ROWS_PER_SHEET:
+                                break
+                    except Exception as cell_err:
+                        print(f'⚠️ Row error: {cell_err}', flush=True)
+                        continue
+            except Exception as e:
+                print(f'⚠️ Error reading sheet {sheet_name}: {e}', flush=True)
+                continue
+
+            if not raw_data or len(raw_data) < 1:
+                continue
+
+            header = raw_data[0]
+            while len(header) < MAX_COLS:
+                header.append('')
+
             col_types = []
-            for col_idx in range(len(df.columns)):
-                col_values = df.iloc[:, col_idx].dropna().astype(str).tolist()
+            for col_idx in range(len(header)):
+                col_values = [row[col_idx] for row in raw_data[1:51] if col_idx < len(row)]
                 col_types.append(detect_column_type(col_values))
 
-            # Sheet header
             if total_sheets > 1:
                 story.append(Paragraph(
                     f'📄 Sheet {sheet_idx + 1}: {escape_xml(sheet_name)}',
@@ -639,9 +640,16 @@ def excel_to_pdf():
                     sheet_style
                 ))
 
-            col_widths = calculate_column_widths(df)
+            display_data = []
+            for row in raw_data:
+                display_row = [smart_truncate(c, 50) for c in row]
+                while len(display_row) < len(header):
+                    display_row.append('')
+                display_data.append(display_row)
 
-            pdf_table = Table(table_data, colWidths=col_widths, repeatRows=1)
+            col_widths = calculate_column_widths(display_data)
+
+            pdf_table = Table(display_data, colWidths=col_widths, repeatRows=1)
 
             table_styles = [
                 ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#a855f7')),
@@ -677,11 +685,10 @@ def excel_to_pdf():
             story.append(pdf_table)
             story.append(Spacer(1, 8))
 
-            data_rows = len(table_data) - 1
+            data_rows = len(display_data) - 1
             story.append(Paragraph(
                 f'<font size="8" color="#666666">'
-                f'✓ {data_rows} rows • {len(df.columns)} columns • '
-                f'AI detected: {", ".join(set(col_types))}'
+                f'✓ {data_rows} rows • {len(header)} columns'
                 f'</font>',
                 styles['Normal']
             ))
@@ -691,13 +698,18 @@ def excel_to_pdf():
             if sheet_idx < total_sheets - 1:
                 story.append(PageBreak())
 
+        try:
+            wb.close()
+        except:
+            pass
+
         if total_rows_converted == 0:
             return 'Excel file is empty (no data found)', 400
 
         story.append(Spacer(1, 12))
         story.append(Paragraph(
             f'<font size="8" color="#a855f7"><b>📊 Summary:</b> '
-            f'{total_sheets} sheet(s) • {total_rows_converted} total rows converted</font>',
+            f'{total_sheets} sheet(s) • {total_rows_converted} rows converted</font>',
             styles['Normal']
         ))
 
@@ -726,7 +738,6 @@ def excel_to_pdf():
             canvas.drawCentredString(0, 0, 'BHARAT24TOOLS')
             canvas.restoreState()
 
-        # ========== BUILD PDF ==========
         pdf.build(story, onFirstPage=add_page_decorations, onLaterPages=add_page_decorations)
 
         output_size = os.path.getsize(output_path)
@@ -1230,7 +1241,7 @@ def ocr():
         cleanup_dir(temp_dir)
 
 
-# ========== 18. AVIF TO JPG (Client-side fallback) ==========
+# ========== 18. AVIF TO JPG ==========
 @app.route('/avif-to-jpg', methods=['POST'])
 def avif_to_jpg():
     return 'Please use client-side version at /avif-to-jpg.html', 400
