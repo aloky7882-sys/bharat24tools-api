@@ -19,7 +19,6 @@ MAX_FILE_SIZE = 20 * 1024 * 1024
 MAX_FILES_COUNT = 20
 PROCESSING_TIMEOUT = 90
 CLEANUP_DELAY = 30
-MAX_CELLS = 50
 
 processing_lock = threading.Lock()
 
@@ -66,7 +65,7 @@ HTML = '''
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Bharat24Tools API v8.9</title>
+    <title>Bharat24Tools API v9.0</title>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <style>
         * { margin:0; padding:0; box-sizing:border-box; font-family:Arial,sans-serif; }
@@ -83,7 +82,7 @@ HTML = '''
 </head>
 <body>
     <div class="container">
-        <h1>⚡ Bharat24Tools API v8.9</h1>
+        <h1>⚡ Bharat24Tools API v9.0</h1>
         <p class="status-badge">Server is running ✅ — 24 Tools Active</p>
 
         <div class="section-title">📄 PDF Tools (13)</div>
@@ -109,12 +108,12 @@ HTML = '''
         <div class="endpoint"><code>POST /avif-to-jpg</code><span class="desc">AVIF to JPG</span></div>
         <div class="endpoint"><code>POST /image-to-sketch</code><span class="desc">Image to Sketch</span></div>
         <div class="endpoint"><code>POST /gif-maker</code><span class="desc">GIF Maker</span></div>
-        <div class="endpoint"><code>POST /image-to-word</code><span class="desc">Image to Word ✅ 15MB + Cell Limit</span></div>
-        <div class="endpoint"><code>POST /image-to-excel</code><span class="desc">Image to Excel ✅ 15MB + Cell Limit</span></div>
+        <div class="endpoint"><code>POST /image-to-word</code><span class="desc">Image to Word ✅ Gemini AI 3 Files</span></div>
+        <div class="endpoint"><code>POST /image-to-excel</code><span class="desc">Image to Excel ✅ Gemini AI 3 Files</span></div>
         <div class="endpoint"><code>POST /pdf-watermark</code><span class="desc">PDF Watermark</span></div>
         <div class="endpoint"><code>POST /pdf-page-delete</code><span class="desc">PDF Page Delete</span></div>
 
-        <p class="footer">Version 8.9 — 24 Tools Active | 15MB + Cell Limit + 90s Timeout</p>
+        <p class="footer">Version 9.0 — 24 Tools | AI-Powered OCR (Max 3 Files)</p>
     </div>
 </body>
 </html>
@@ -159,14 +158,12 @@ def health():
     return {
         'status': 'ok',
         'service': 'bharat24tools-api',
-        'version': '8.9',
+        'version': '9.0',
         'tools': 24,
-        'ghostscript': True,
-        'auto_cleanup': True,
-        'max_cells': MAX_CELLS,
-        'processing_timeout': PROCESSING_TIMEOUT,
-        'image_to_word': 'single-image-15mb-cell-limit',
-        'image_to_excel': 'single-image-15mb-cell-limit'
+        'ocr_engine': 'gemini-1.5-flash',
+        'gemini_configured': bool(os.environ.get('GEMINI_API_KEY', '').strip()),
+        'max_files_ocr': 3,
+        'auto_cleanup': True
     }
 
 
@@ -1371,261 +1368,210 @@ def gif_maker():
         cleanup_dir(temp_dir)
 
 
-# ========== 21. IMAGE TO WORD (1 image, 15MB, Cell Limit) ==========
+# ========== 21. IMAGE TO WORD (Gemini AI, Max 3 Files) ==========
 @app.route('/image-to-word', methods=['POST'])
 def image_to_word():
     if not processing_lock.acquire(timeout=300):
         return 'Server busy. Try again.', 503
     temp_dir = tempfile.mkdtemp()
     try:
-        if 'file' in request.files:
-            file = request.files['file']
-        elif 'files' in request.files:
+        if 'files' in request.files:
             files = request.files.getlist('files')
-            file = files[0] if files else None
+        elif 'file' in request.files:
+            files = [request.files['file']]
         else:
-            return 'No file uploaded', 400
+            return 'No files uploaded', 400
 
-        if not file:
-            return 'No file uploaded', 400
+        files = [f for f in files if f and f.filename]
+        if not files:
+            return 'No files uploaded', 400
+        if len(files) > 3:
+            return 'Max 3 files allowed per request', 400
 
-        valid, msg = validate_file(
-            file,
-            allowed_ext=['.jpg', '.jpeg', '.png', '.webp', '.bmp', '.tiff', '.tif'],
-            max_size=15 * 1024 * 1024
-        )
-        if not valid:
-            return msg, 400
-
-        lang = request.form.get('lang', 'eng')
         custom_title = request.form.get('title', 'Extracted Text')[:60]
 
-        output_path = os.path.join(temp_dir, 'output.docx')
-
-        from PIL import Image, ImageEnhance, ImageFilter
-        import pytesseract
-        import cv2
-        import numpy as np
+        import google.generativeai as genai
+        import json
+        from PIL import Image
         from docx import Document
         from docx.shared import Pt, RGBColor, Cm
         from docx.enum.text import WD_ALIGN_PARAGRAPH
         from datetime import datetime
 
-        pytesseract.pytesseract.tesseract_cmd = r'/usr/bin/tesseract'
+        api_key = os.environ.get('GEMINI_API_KEY', '').strip()
+        if not api_key:
+            return 'Server not configured. Contact admin.', 500
 
-        def detect_table_cells(image_path):
-            try:
-                img = cv2.imread(image_path)
-                if img is None:
-                    return None
-                gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-                binary = cv2.adaptiveThreshold(~gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 15, -2)
-                hk = cv2.getStructuringElement(cv2.MORPH_RECT, (40, 1))
-                horizontal = cv2.morphologyEx(binary, cv2.MORPH_OPEN, hk, iterations=1)
-                horizontal = cv2.dilate(horizontal, hk, iterations=2)
-                vk = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 40))
-                vertical = cv2.morphologyEx(binary, cv2.MORPH_OPEN, vk, iterations=1)
-                vertical = cv2.dilate(vertical, vk, iterations=2)
-                h_contours, _ = cv2.findContours(horizontal, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                v_contours, _ = cv2.findContours(vertical, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                h_lines = sorted([cv2.boundingRect(c)[1] for c in h_contours if cv2.boundingRect(c)[2] > 100])
-                v_lines = sorted([cv2.boundingRect(c)[0] for c in v_contours if cv2.boundingRect(c)[3] > 100])
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel('gemini-1.5-flash')
 
-                def merge_close(positions, threshold=10):
-                    if not positions:
-                        return []
-                    merged = [positions[0]]
-                    for pos in positions[1:]:
-                        if pos - merged[-1] > threshold:
-                            merged.append(pos)
-                    return merged
+        prompt = """Extract ALL text from this image, preserving structure.
+Return ONLY valid JSON, no explanation, no markdown:
+{"tables":[{"rows":[["cell1","cell2"],["cell3","cell4"]]}],"plain_text":"any text outside tables"}
+Rules:
+- Preserve EXACT text including Hindi/Devanagari
+- Each table row is an array of cell strings
+- If no table but structured data exists, treat as 1-column table
+- If only plain text, tables = [], plain_text = full text
+- Return ONLY JSON"""
 
-                h_lines = merge_close(h_lines)
-                v_lines = merge_close(v_lines)
-                if len(h_lines) < 3 or len(v_lines) < 3:
-                    return None
-                rows = len(h_lines) - 1
-                cols = len(v_lines) - 1
-                if rows < 1 or cols < 1 or rows > 100 or cols > 20:
-                    return None
-                cells = []
-                for r in range(rows):
-                    row_cells = []
-                    for c in range(cols):
-                        x1 = v_lines[c]
-                        y1 = h_lines[r]
-                        x2 = v_lines[c + 1]
-                        y2 = h_lines[r + 1]
-                        row_cells.append((x1, y1, x2 - x1, y2 - y1))
-                    cells.append(row_cells)
-                return cells
-            except:
-                return None
+        results = []
 
-        def ocr_cell(image_np, cell_bbox):
-            x, y, w, h = cell_bbox
-            pad = 2
-            x1 = max(0, x + pad)
-            y1 = max(0, y + pad)
-            x2 = min(image_np.shape[1], x + w - pad)
-            y2 = min(image_np.shape[0], y + h - pad)
-            if x2 - x1 < 5 or y2 - y1 < 5:
-                return ''
-            cell_img = image_np[y1:y2, x1:x2]
-            if len(cell_img.shape) == 3:
-                cell_gray = cv2.cvtColor(cell_img, cv2.COLOR_BGR2GRAY)
-            else:
-                cell_gray = cell_img
-            h_cell, w_cell = cell_gray.shape
-            if h_cell < 40 or w_cell < 40:
-                scale = max(40 / h_cell, 40 / w_cell, 2)
-                cell_gray = cv2.resize(cell_gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
-            _, cell_thresh = cv2.threshold(cell_gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-            try:
-                return pytesseract.image_to_string(cell_thresh, lang=lang, config='--psm 6').strip()
-            except:
-                return ''
+        for idx, file in enumerate(files):
+            valid, msg = validate_file(
+                file,
+                allowed_ext=['.jpg', '.jpeg', '.png', '.webp', '.bmp', '.tiff', '.tif'],
+                max_size=15 * 1024 * 1024
+            )
+            if not valid:
+                return f'File {idx+1} ({file.filename}): {msg}', 400
 
-        def fallback_text_extract(image_path):
-            img = Image.open(image_path)
-            if img.mode != 'RGB':
-                img = img.convert('RGB')
-            max_dim = 2200
-            if max(img.size) > max_dim:
-                ratio = max_dim / max(img.size)
-                img = img.resize((int(img.width * ratio), int(img.height * ratio)), Image.LANCZOS)
-            try:
-                img = ImageEnhance.Contrast(img).enhance(1.3)
-                img = img.filter(ImageFilter.SHARPEN)
-            except:
-                pass
-            try:
-                return pytesseract.image_to_string(img, lang=lang).strip()
-            except:
-                return ''
-
-        ext = os.path.splitext(file.filename)[1].lower() or '.png'
-        input_path = os.path.join(temp_dir, f'input{ext}')
-        file.save(input_path)
-
-        doc = Document()
-        for section in doc.sections:
-            section.top_margin = Cm(2)
-            section.bottom_margin = Cm(2)
-            section.left_margin = Cm(2)
-            section.right_margin = Cm(2)
-
-        title_para = doc.add_heading(custom_title, 0)
-        title_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        if title_para.runs:
-            title_para.runs[0].font.color.rgb = RGBColor(0xa8, 0x55, 0xf7)
-            title_para.runs[0].font.size = Pt(22)
-
-        sub = doc.add_paragraph()
-        sub.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        sub_run = sub.add_run(f'OCR Language: {lang} • Created: {datetime.now().strftime("%d %b %Y, %I:%M %p")}')
-        sub_run.font.size = Pt(9)
-        sub_run.font.color.rgb = RGBColor(0x66, 0x66, 0x66)
-        sub_run.italic = True
-        doc.add_paragraph()
-
-        print(f'🔍 Detecting table...', flush=True)
-        cells = detect_table_cells(input_path)
-
-        if cells:
-            rows_count = len(cells)
-            cols_count = len(cells[0])
-            total_cells = rows_count * cols_count
-
-            if total_cells > MAX_CELLS:
-                print(f'⚠️ Too many cells ({total_cells}). Limiting to {MAX_CELLS}.', flush=True)
-                flat_cells = []
-                for row in cells:
-                    for cell in row:
-                        flat_cells.append(cell)
-                flat_cells = flat_cells[:MAX_CELLS]
-                cells = [flat_cells]
-                rows_count = 1
-                cols_count = len(flat_cells)
-
-            print(f'✅ Table: {rows_count}×{cols_count}', flush=True)
-            img_np = cv2.imread(input_path)
-            if img_np.shape[0] < 800:
-                scale = 800 / img_np.shape[0]
-                img_np = cv2.resize(img_np, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
-                cells = [[(int(x * scale), int(y * scale), int(w * scale), int(h * scale))
-                          for (x, y, w, h) in row] for row in cells]
-            grid = []
-            for row_cells in cells:
-                row_data = []
-                for bbox in row_cells:
-                    row_data.append(ocr_cell(img_np, bbox))
-                grid.append(row_data)
-
-            table = doc.add_table(rows=rows_count, cols=cols_count)
-            try:
-                table.style = 'Light Grid Accent 1'
-            except:
-                table.style = 'Table Grid'
-
-            for r_idx, row_data in enumerate(grid):
-                for c_idx in range(cols_count):
-                    cell_text = row_data[c_idx] if c_idx < len(row_data) else ''
-                    cell = table.cell(r_idx, c_idx)
-                    cell.text = cell_text
-                    for para in cell.paragraphs:
-                        for run in para.runs:
-                            run.font.size = Pt(10)
-                            if r_idx == 0:
-                                run.font.bold = True
+            ext = os.path.splitext(file.filename)[1].lower() or '.png'
+            input_path = os.path.join(temp_dir, f'input_{idx}{ext}')
+            file.save(input_path)
 
             try:
-                from docx.oxml.ns import qn
-                from docx.oxml import OxmlElement
-                for c_idx in range(cols_count):
-                    cell = table.cell(0, c_idx)
-                    tcPr = cell._tc.get_or_add_tcPr()
-                    shd = OxmlElement('w:shd')
-                    shd.set(qn('w:fill'), 'A855F7')
-                    tcPr.append(shd)
-                    for para in cell.paragraphs:
-                        for run in para.runs:
-                            run.font.color.rgb = RGBColor(0xFF, 0xFF, 0xFF)
-            except:
-                pass
-        else:
-            print(f'⚠️ No table, plain text', flush=True)
-            text = fallback_text_extract(input_path)
-            if text:
-                for line in text.split('\n'):
-                    if line.strip():
-                        p = doc.add_paragraph()
-                        run = p.add_run(line.strip())
-                        run.font.size = Pt(11)
-                        run.font.name = 'Calibri'
-                        p.paragraph_format.space_after = Pt(6)
-            else:
-                p = doc.add_paragraph()
-                run = p.add_run('(No text could be extracted)')
-                run.font.color.rgb = RGBColor(0xCC, 0x00, 0x00)
-                run.italic = True
+                img = Image.open(input_path)
+                if img.mode != 'RGB':
+                    img = img.convert('RGB')
+                max_dim = 2000
+                if max(img.size) > max_dim:
+                    ratio = max_dim / max(img.size)
+                    img = img.resize((int(img.width * ratio), int(img.height * ratio)), Image.LANCZOS)
 
-        doc.add_paragraph()
-        footer = doc.add_paragraph()
-        footer.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        footer_run = footer.add_run('Generated by Bharat24Tools — Free Online Tools')
-        footer_run.font.size = Pt(9)
-        footer_run.font.color.rgb = RGBColor(0x99, 0x99, 0x99)
-        footer_run.italic = True
+                print(f'🤖 Gemini processing {file.filename}...', flush=True)
+                response = model.generate_content([prompt, img])
+                text = response.text.strip()
 
-        doc.save(output_path)
-        print(f'✅ Image to Word done', flush=True)
+                if text.startswith('```'):
+                    parts = text.split('```')
+                    text = parts[1] if len(parts) > 1 else text
+                    if text.startswith('json'):
+                        text = text[4:]
+                text = text.strip()
 
+                try:
+                    data = json.loads(text)
+                except:
+                    data = {'tables': [], 'plain_text': text}
+
+                doc = Document()
+                for section in doc.sections:
+                    section.top_margin = Cm(2)
+                    section.bottom_margin = Cm(2)
+                    section.left_margin = Cm(2)
+                    section.right_margin = Cm(2)
+
+                title_text = custom_title if len(files) == 1 else f'{custom_title} - {idx+1}'
+                title_para = doc.add_heading(title_text, 0)
+                title_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                if title_para.runs:
+                    title_para.runs[0].font.color.rgb = RGBColor(0xa8, 0x55, 0xf7)
+                    title_para.runs[0].font.size = Pt(22)
+
+                sub = doc.add_paragraph()
+                sub.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                sub_run = sub.add_run(f'AI OCR • {datetime.now().strftime("%d %b %Y, %I:%M %p")}')
+                sub_run.font.size = Pt(9)
+                sub_run.font.color.rgb = RGBColor(0x66, 0x66, 0x66)
+                sub_run.italic = True
+                doc.add_paragraph()
+
+                tables = data.get('tables', [])
+                plain_text = data.get('plain_text', '').strip()
+
+                for t_idx, table_data in enumerate(tables):
+                    rows = table_data.get('rows', [])
+                    if not rows:
+                        continue
+                    cols = max(len(r) for r in rows)
+                    if cols == 0:
+                        continue
+
+                    tbl = doc.add_table(rows=len(rows), cols=cols)
+                    try:
+                        tbl.style = 'Light Grid Accent 1'
+                    except:
+                        tbl.style = 'Table Grid'
+
+                    for r_idx, row in enumerate(rows):
+                        for c_idx in range(cols):
+                            cell_text = row[c_idx] if c_idx < len(row) else ''
+                            cell = tbl.cell(r_idx, c_idx)
+                            cell.text = str(cell_text)
+                            for p in cell.paragraphs:
+                                for run in p.runs:
+                                    run.font.size = Pt(10)
+                                    if r_idx == 0:
+                                        run.font.bold = True
+
+                    try:
+                        from docx.oxml.ns import qn
+                        from docx.oxml import OxmlElement
+                        for c_idx in range(cols):
+                            cell = tbl.cell(0, c_idx)
+                            tcPr = cell._tc.get_or_add_tcPr()
+                            shd = OxmlElement('w:shd')
+                            shd.set(qn('w:fill'), 'A855F7')
+                            tcPr.append(shd)
+                            for p in cell.paragraphs:
+                                for run in p.runs:
+                                    run.font.color.rgb = RGBColor(0xFF, 0xFF, 0xFF)
+                    except:
+                        pass
+
+                    if t_idx < len(tables) - 1:
+                        doc.add_paragraph()
+
+                if plain_text:
+                    for line in plain_text.split('\n'):
+                        if line.strip():
+                            p = doc.add_paragraph()
+                            run = p.add_run(line.strip())
+                            run.font.size = Pt(11)
+                            p.paragraph_format.space_after = Pt(6)
+
+                doc.add_paragraph()
+                footer = doc.add_paragraph()
+                footer.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                fr = footer.add_run('Generated by Bharat24Tools — AI Powered')
+                fr.font.size = Pt(9)
+                fr.font.color.rgb = RGBColor(0x99, 0x99, 0x99)
+                fr.italic = True
+
+                base_name = os.path.splitext(file.filename)[0]
+                base_name = re.sub(r'[\\/\*\?\:\[\]<>|]', '_', base_name)[:50] or f'file_{idx+1}'
+                output_path = os.path.join(temp_dir, f'output_{idx}.docx')
+                doc.save(output_path)
+                results.append((base_name, output_path))
+                print(f'✅ {file.filename} done ({len(tables)} tables)', flush=True)
+
+            except Exception as e:
+                print(f'❌ File {file.filename} error: {e}', flush=True)
+                continue
+
+        if not results:
+            return 'No content extracted from any file.', 400
+
+        if len(results) == 1:
+            base_name, output_path = results[0]
+            return send_file(
+                output_path,
+                mimetype='application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+                as_attachment=True,
+                download_name=f'Bharat24Tools_AI_{base_name}.docx'
+            )
+
+        zip_buffer = io.BytesIO()
+        with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
+            for base_name, path in results:
+                zf.write(path, f'{base_name}.docx')
+        zip_buffer.seek(0)
         return send_file(
-            output_path,
-            mimetype='application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+            zip_buffer,
+            mimetype='application/zip',
             as_attachment=True,
-            download_name=f'Bharat24Tools_OCR_{datetime.now().strftime("%Y%m%d_%H%M")}.docx'
+            download_name=f'Bharat24Tools_AI_{datetime.now().strftime("%Y%m%d_%H%M")}.zip'
         )
 
     except Exception as e:
@@ -1638,295 +1584,186 @@ def image_to_word():
         cleanup_dir(temp_dir)
 
 
-# ========== 22. IMAGE TO EXCEL (1 image, 15MB, Cell Limit) ==========
+# ========== 22. IMAGE TO EXCEL (Gemini AI, Max 3 Files) ==========
 @app.route('/image-to-excel', methods=['POST'])
 def image_to_excel():
     if not processing_lock.acquire(timeout=300):
         return 'Server busy. Try again.', 503
     temp_dir = tempfile.mkdtemp()
     try:
-        if 'file' in request.files:
-            file = request.files['file']
-        elif 'files' in request.files:
+        if 'files' in request.files:
             files = request.files.getlist('files')
-            file = files[0] if files else None
+        elif 'file' in request.files:
+            files = [request.files['file']]
         else:
-            return 'No file uploaded', 400
+            return 'No files uploaded', 400
 
-        if not file:
-            return 'No file uploaded', 400
+        files = [f for f in files if f and f.filename]
+        if not files:
+            return 'No files uploaded', 400
+        if len(files) > 3:
+            return 'Max 3 files allowed per request', 400
 
-        valid, msg = validate_file(
-            file,
-            allowed_ext=['.jpg', '.jpeg', '.png', '.webp', '.bmp', '.tiff', '.tif'],
-            max_size=15 * 1024 * 1024
-        )
-        if not valid:
-            return msg, 400
-
-        lang = request.form.get('lang', 'eng')
-        output_path = os.path.join(temp_dir, 'output.xlsx')
-
-        from PIL import Image, ImageEnhance
-        import pytesseract
-        import cv2
-        import numpy as np
+        import google.generativeai as genai
+        import json
+        from PIL import Image
         from openpyxl import Workbook
         from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
         from openpyxl.utils import get_column_letter
         from datetime import datetime
 
-        pytesseract.pytesseract.tesseract_cmd = r'/usr/bin/tesseract'
+        api_key = os.environ.get('GEMINI_API_KEY', '').strip()
+        if not api_key:
+            return 'Server not configured. Contact admin.', 500
 
-        ext = os.path.splitext(file.filename)[1].lower() or '.png'
-        input_path = os.path.join(temp_dir, f'input{ext}')
-        file.save(input_path)
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel('gemini-1.5-flash')
 
-        def detect_table_cells(image_path):
+        prompt = """Extract ALL table data from this image.
+Return ONLY valid JSON, no explanation, no markdown:
+{"tables":[{"name":"Table 1","rows":[["cell1","cell2"],["cell3","cell4"]]}]}
+Rules:
+- Preserve EXACT text including Hindi/Devanagari
+- Each row is array of cell strings, keep same column count
+- If multiple tables, return multiple objects
+- If no table, treat whole content as one table
+- Empty cells = ""
+- Return ONLY JSON, nothing else"""
+
+        results = []
+
+        for idx, file in enumerate(files):
+            valid, msg = validate_file(
+                file,
+                allowed_ext=['.jpg', '.jpeg', '.png', '.webp', '.bmp', '.tiff', '.tif'],
+                max_size=15 * 1024 * 1024
+            )
+            if not valid:
+                return f'File {idx+1} ({file.filename}): {msg}', 400
+
+            ext = os.path.splitext(file.filename)[1].lower() or '.png'
+            input_path = os.path.join(temp_dir, f'input_{idx}{ext}')
+            file.save(input_path)
+
             try:
-                img = cv2.imread(image_path)
-                if img is None:
-                    return None
-                gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-                binary = cv2.adaptiveThreshold(~gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 15, -2)
-                hk = cv2.getStructuringElement(cv2.MORPH_RECT, (40, 1))
-                horizontal = cv2.morphologyEx(binary, cv2.MORPH_OPEN, hk, iterations=1)
-                horizontal = cv2.dilate(horizontal, hk, iterations=2)
-                vk = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 40))
-                vertical = cv2.morphologyEx(binary, cv2.MORPH_OPEN, vk, iterations=1)
-                vertical = cv2.dilate(vertical, vk, iterations=2)
-                h_contours, _ = cv2.findContours(horizontal, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                v_contours, _ = cv2.findContours(vertical, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                h_lines = sorted([cv2.boundingRect(c)[1] for c in h_contours if cv2.boundingRect(c)[2] > 100])
-                v_lines = sorted([cv2.boundingRect(c)[0] for c in v_contours if cv2.boundingRect(c)[3] > 100])
-
-                def merge_close(positions, threshold=10):
-                    if not positions:
-                        return []
-                    merged = [positions[0]]
-                    for pos in positions[1:]:
-                        if pos - merged[-1] > threshold:
-                            merged.append(pos)
-                    return merged
-
-                h_lines = merge_close(h_lines)
-                v_lines = merge_close(v_lines)
-                if len(h_lines) < 3 or len(v_lines) < 3:
-                    return None
-                rows = len(h_lines) - 1
-                cols = len(v_lines) - 1
-                if rows < 1 or cols < 1 or rows > 100 or cols > 20:
-                    return None
-                cells = []
-                for r in range(rows):
-                    row_cells = []
-                    for c in range(cols):
-                        x1 = v_lines[c]
-                        y1 = h_lines[r]
-                        x2 = v_lines[c + 1]
-                        y2 = h_lines[r + 1]
-                        row_cells.append((x1, y1, x2 - x1, y2 - y1))
-                    cells.append(row_cells)
-                return cells
-            except:
-                return None
-
-        def ocr_cell(image_np, cell_bbox):
-            x, y, w, h = cell_bbox
-            pad = 2
-            x1 = max(0, x + pad)
-            y1 = max(0, y + pad)
-            x2 = min(image_np.shape[1], x + w - pad)
-            y2 = min(image_np.shape[0], y + h - pad)
-            if x2 - x1 < 5 or y2 - y1 < 5:
-                return ''
-            cell_img = image_np[y1:y2, x1:x2]
-            if len(cell_img.shape) == 3:
-                cell_gray = cv2.cvtColor(cell_img, cv2.COLOR_BGR2GRAY)
-            else:
-                cell_gray = cell_img
-            h_cell, w_cell = cell_gray.shape
-            if h_cell < 40 or w_cell < 40:
-                scale = max(40 / h_cell, 40 / w_cell, 2)
-                cell_gray = cv2.resize(cell_gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
-            _, cell_thresh = cv2.threshold(cell_gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-            try:
-                return pytesseract.image_to_string(cell_thresh, lang=lang, config='--psm 6').strip()
-            except:
-                return ''
-
-        def fallback_ocr_to_grid(image_path):
-            try:
-                img = Image.open(image_path)
+                img = Image.open(input_path)
                 if img.mode != 'RGB':
                     img = img.convert('RGB')
-                max_dim = 2200
+                max_dim = 2000
                 if max(img.size) > max_dim:
                     ratio = max_dim / max(img.size)
                     img = img.resize((int(img.width * ratio), int(img.height * ratio)), Image.LANCZOS)
+
+                print(f'🤖 Gemini processing {file.filename}...', flush=True)
+                response = model.generate_content([prompt, img])
+                text = response.text.strip()
+
+                if text.startswith('```'):
+                    parts = text.split('```')
+                    text = parts[1] if len(parts) > 1 else text
+                    if text.startswith('json'):
+                        text = text[4:]
+                text = text.strip()
+
                 try:
-                    img = ImageEnhance.Contrast(img).enhance(1.3)
+                    data = json.loads(text)
                 except:
-                    pass
-                ocr_data = pytesseract.image_to_data(img, lang=lang, output_type=pytesseract.Output.DICT, config='--psm 6')
-                words = []
-                n = len(ocr_data['text'])
-                for i in range(n):
-                    text = ocr_data['text'][i].strip()
-                    if not text:
+                    print(f'⚠️ {file.filename}: AI parse failed', flush=True)
+                    continue
+
+                tables = data.get('tables', [])
+                if not tables:
+                    print(f'⚠️ {file.filename}: no tables found', flush=True)
+                    continue
+
+                wb = Workbook()
+                ws = wb.active
+                ws.title = 'Extracted Data'
+
+                thin = Border(
+                    left=Side(style='thin', color='CCCCCC'),
+                    right=Side(style='thin', color='CCCCCC'),
+                    top=Side(style='thin', color='CCCCCC'),
+                    bottom=Side(style='thin', color='CCCCCC')
+                )
+
+                current_row = 1
+
+                for t_idx, table_data in enumerate(tables):
+                    rows = table_data.get('rows', [])
+                    if not rows:
                         continue
-                    try:
-                        if int(ocr_data['conf'][i]) < 25:
-                            continue
-                    except:
+
+                    cols = max(len(r) for r in rows) if rows else 0
+                    if cols == 0:
                         continue
-                    words.append({'text': text, 'left': ocr_data['left'][i], 'top': ocr_data['top'][i]})
-                if not words:
-                    return []
-                words.sort(key=lambda w: (w['top'], w['left']))
-                lines = []
-                current = [words[0]]
-                for w in words[1:]:
-                    if abs(w['top'] - current[-1]['top']) < 15:
-                        current.append(w)
-                    else:
-                        lines.append(current)
-                        current = [w]
-                lines.append(current)
-                all_lefts = sorted([w['left'] for w in words])
-                col_positions = []
-                cluster = [all_lefts[0]]
-                for x in all_lefts[1:]:
-                    if x - cluster[-1] > 80:
-                        col_positions.append(sum(cluster) / len(cluster))
-                        cluster = [x]
-                    else:
-                        cluster.append(x)
-                col_positions.append(sum(cluster) / len(cluster))
-                col_positions = col_positions[:10]
-                num_cols = max(len(col_positions), 1)
-                grid = []
-                for line in lines:
-                    row = [''] * num_cols
-                    for w in line:
-                        nearest = 0
-                        min_dist = float('inf')
-                        for i, cx in enumerate(col_positions):
-                            d = abs(w['left'] - cx)
-                            if d < min_dist:
-                                min_dist = d
-                                nearest = i
-                        if row[nearest]:
-                            row[nearest] += ' ' + w['text']
-                        else:
-                            row[nearest] = w['text']
-                    if any(cell.strip() for cell in row):
-                        grid.append(row)
-                return grid
+
+                    if len(tables) > 1:
+                        title_cell = ws.cell(row=current_row, column=1, value=f'📄 {table_data.get("name", f"Table {t_idx+1}")}')
+                        title_cell.font = Font(bold=True, size=12, color='FFFFFF')
+                        title_cell.fill = PatternFill('solid', fgColor='A855F7')
+                        title_cell.alignment = Alignment(horizontal='center', vertical='center')
+                        ws.merge_cells(start_row=current_row, start_column=1, end_row=current_row, end_column=max(cols, 3))
+                        ws.row_dimensions[current_row].height = 26
+                        current_row += 2
+
+                    data_start = current_row
+
+                    for r_idx, row in enumerate(rows):
+                        for c_idx in range(cols):
+                            val = row[c_idx] if c_idx < len(row) else ''
+                            cell = ws.cell(row=data_start + r_idx, column=c_idx + 1, value=str(val))
+                            cell.alignment = Alignment(wrap_text=True, vertical='center')
+                            cell.border = thin
+                            if r_idx == 0:
+                                cell.font = Font(bold=True, color='FFFFFF', size=11)
+                                cell.fill = PatternFill('solid', fgColor='A855F7')
+                            elif r_idx % 2 == 0:
+                                cell.fill = PatternFill('solid', fgColor='F8F5FF')
+
+                    for c_idx in range(cols):
+                        col_letter = get_column_letter(c_idx + 1)
+                        max_len = 12
+                        for r_idx in range(len(rows)):
+                            if c_idx < len(rows[r_idx]):
+                                max_len = max(max_len, min(len(str(rows[r_idx][c_idx])), 55))
+                        ws.column_dimensions[col_letter].width = max_len
+
+                    current_row = data_start + len(rows) + 2
+
+                base_name = os.path.splitext(file.filename)[0]
+                base_name = re.sub(r'[\\/\*\?\:\[\]<>|]', '_', base_name)[:50] or f'file_{idx+1}'
+                output_path = os.path.join(temp_dir, f'output_{idx}.xlsx')
+                wb.save(output_path)
+                results.append((base_name, output_path))
+                print(f'✅ {file.filename} done ({len(tables)} tables)', flush=True)
+
             except Exception as e:
-                print(f'Fallback error: {e}', flush=True)
-                return []
+                print(f'❌ File {file.filename} error: {e}', flush=True)
+                continue
 
-        print(f'🔍 Processing: {file.filename}', flush=True)
-        cells = detect_table_cells(input_path)
-        grid = []
-        method = ''
+        if not results:
+            return 'No table data extracted from any file.', 400
 
-        if cells:
-            rows_count = len(cells)
-            cols_count = len(cells[0])
-            total_cells = rows_count * cols_count
+        if len(results) == 1:
+            base_name, output_path = results[0]
+            return send_file(
+                output_path,
+                mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                as_attachment=True,
+                download_name=f'Bharat24Tools_AI_{base_name}.xlsx'
+            )
 
-            if total_cells > MAX_CELLS:
-                print(f'⚠️ Too many cells ({total_cells}). Limiting to {MAX_CELLS}.', flush=True)
-                flat_cells = []
-                for row in cells:
-                    for cell in row:
-                        flat_cells.append(cell)
-                flat_cells = flat_cells[:MAX_CELLS]
-                cells = [flat_cells]
-                rows_count = 1
-                cols_count = len(flat_cells)
-
-            print(f'✅ Table: {rows_count}×{cols_count}', flush=True)
-            method = 'Table (OpenCV)'
-            img_np = cv2.imread(input_path)
-            if img_np.shape[0] < 800:
-                scale = 800 / img_np.shape[0]
-                img_np = cv2.resize(img_np, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
-                cells = [[(int(x * scale), int(y * scale), int(w * scale), int(h * scale))
-                          for (x, y, w, h) in row] for row in cells]
-            for row_cells in cells:
-                row_data = []
-                for bbox in row_cells:
-                    row_data.append(ocr_cell(img_np, bbox))
-                grid.append(row_data)
-        else:
-            print(f'⚠️ No table, line-based OCR', flush=True)
-            method = 'OCR (line-based)'
-            grid = fallback_ocr_to_grid(input_path)
-
-        if not grid:
-            return 'No text found in image.', 400
-
-        rows_count = len(grid)
-        cols_count = max(len(row) for row in grid) if grid else 0
-        if rows_count == 0 or cols_count == 0:
-            return 'No data extracted', 400
-
-        wb = Workbook()
-        ws = wb.active
-        ws.title = 'Extracted Data'
-
-        ws['A1'] = f'📄 {file.filename}'
-        ws['A1'].font = Font(bold=True, size=14, color='FFFFFF')
-        ws['A1'].fill = PatternFill('solid', fgColor='A855F7')
-        ws['A1'].alignment = Alignment(horizontal='center', vertical='center')
-        ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=max(cols_count, 3))
-        ws.row_dimensions[1].height = 30
-
-        ws['A2'] = f'Method: {method} • {rows_count} rows × {cols_count} cols • {datetime.now().strftime("%d %b %Y, %I:%M %p")}'
-        ws['A2'].font = Font(size=9, italic=True, color='666666')
-        ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=max(cols_count, 3))
-
-        data_start = 4
-        thin = Border(
-            left=Side(style='thin', color='CCCCCC'),
-            right=Side(style='thin', color='CCCCCC'),
-            top=Side(style='thin', color='CCCCCC'),
-            bottom=Side(style='thin', color='CCCCCC')
-        )
-
-        for r_idx, row_data in enumerate(grid):
-            for c_idx in range(cols_count):
-                val = row_data[c_idx] if c_idx < len(row_data) else ''
-                cell = ws.cell(row=data_start + r_idx, column=c_idx + 1, value=val)
-                cell.alignment = Alignment(wrap_text=True, vertical='center')
-                cell.border = thin
-                if r_idx == 0:
-                    cell.font = Font(bold=True, color='FFFFFF', size=11)
-                    cell.fill = PatternFill('solid', fgColor='A855F7')
-                elif r_idx % 2 == 0:
-                    cell.fill = PatternFill('solid', fgColor='F8F5FF')
-
-        for c_idx in range(cols_count):
-            col_letter = get_column_letter(c_idx + 1)
-            max_len = 12
-            for r_idx in range(rows_count):
-                if c_idx < len(grid[r_idx]):
-                    max_len = max(max_len, min(len(str(grid[r_idx][c_idx])), 55))
-            ws.column_dimensions[col_letter].width = max_len
-
-        ws.freeze_panes = f'A{data_start}'
-
-        wb.save(output_path)
-        print(f'✅ Done: 1 sheet, {rows_count}×{cols_count}', flush=True)
-
+        zip_buffer = io.BytesIO()
+        with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
+            for base_name, path in results:
+                zf.write(path, f'{base_name}.xlsx')
+        zip_buffer.seek(0)
         return send_file(
-            output_path,
-            mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            zip_buffer,
+            mimetype='application/zip',
             as_attachment=True,
-            download_name=f'Bharat24Tools_{file.filename.rsplit(".", 1)[0]}.xlsx'
+            download_name=f'Bharat24Tools_AI_{datetime.now().strftime("%Y%m%d_%H%M")}.zip'
         )
 
     except Exception as e:
