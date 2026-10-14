@@ -17,7 +17,7 @@ CORS(app)
 # ==================== CONFIGURATION ====================
 MAX_FILE_SIZE = 20 * 1024 * 1024
 MAX_FILES_COUNT = 20
-PROCESSING_TIMEOUT = 90
+PROCESSING_TIMEOUT = 120
 CLEANUP_DELAY = 30
 
 processing_lock = threading.Lock()
@@ -65,7 +65,7 @@ HTML = '''
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Bharat24Tools API v9.3</title>
+    <title>Bharat24Tools API v9.4</title>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <style>
         * { margin:0; padding:0; box-sizing:border-box; font-family:Arial,sans-serif; }
@@ -82,11 +82,11 @@ HTML = '''
 </head>
 <body>
     <div class="container">
-        <h1>⚡ Bharat24Tools API v9.3</h1>
+        <h1>⚡ Bharat24Tools API v9.4</h1>
         <p class="status-badge">Server is running ✅ — 24 Tools Active</p>
 
         <div class="section-title">📄 PDF Tools (13)</div>
-        <div class="endpoint"><code>POST /compress</code><span class="desc">Compress PDF</span></div>
+        <div class="endpoint"><code>POST /compress</code><span class="desc">Compress PDF ✅ 50KB-2GB</span></div>
         <div class="endpoint"><code>POST /pdf-to-jpg</code><span class="desc">PDF to Images</span></div>
         <div class="endpoint"><code>POST /jpg-to-pdf</code><span class="desc">Images to PDF</span></div>
         <div class="endpoint"><code>POST /pdf-to-word</code><span class="desc">PDF to Word</span></div>
@@ -105,7 +105,6 @@ HTML = '''
         <div class="endpoint"><code>POST /webp-to-jpg</code><span class="desc">WebP to JPG</span></div>
         <div class="endpoint"><code>POST /image-upscaler</code><span class="desc">AI Image Upscaler</span></div>
         <div class="endpoint"><code>POST /ocr</code><span class="desc">OCR Multi-Language</span></div>
-        <div class="endpoint"><code>POST /avif-to-jpg</code><span class="desc">AVIF to JPG</span></div>
         <div class="endpoint"><code>POST /image-to-sketch</code><span class="desc">Image to Sketch</span></div>
         <div class="endpoint"><code>POST /gif-maker</code><span class="desc">GIF Maker</span></div>
         <div class="endpoint"><code>POST /image-to-word</code><span class="desc">Image to Word ✅ AI + Fallback</span></div>
@@ -113,7 +112,7 @@ HTML = '''
         <div class="endpoint"><code>POST /pdf-watermark</code><span class="desc">PDF Watermark</span></div>
         <div class="endpoint"><code>POST /pdf-page-delete</code><span class="desc">PDF Page Delete</span></div>
 
-        <p class="footer">Version 9.3 — 24 Tools | AI-Powered OCR (Fallback System)</p>
+        <p class="footer">Version 9.4 — 24 Tools | Progressive PDF Compression (50KB-2GB)</p>
     </div>
 </body>
 </html>
@@ -147,69 +146,97 @@ def validate_file(file, allowed_ext=None, max_size=MAX_FILE_SIZE):
     return True, 'OK'
 
 
+# ==================== NUCLEAR COMPRESSION HELPERS ====================
+def rebuild_pdf_from_images(input_path, output_path, dpi=50, jpeg_q=15, grayscale=False):
+    """Convert PDF to JPEGs, then rebuild as PDF. Nuclear option."""
+    try:
+        img_dir = os.path.join(os.path.dirname(output_path), f'nuclear_{int(time.time()*1000)}')
+        os.makedirs(img_dir, exist_ok=True)
+        img_pattern = os.path.join(img_dir, 'page-%03d.jpg')
+
+        cmd = [
+            'gs', '-dNOPAUSE', '-dBATCH', '-dQUIET',
+            '-sDEVICE=jpeg', f'-r{dpi}', f'-dJPEGQ={jpeg_q}',
+        ]
+        if grayscale:
+            cmd.extend(['-sColorConversionStrategy=Gray', '-dProcessColorModel=/DeviceGray'])
+        cmd.extend([f'-sOutputFile={img_pattern}', input_path])
+
+        subprocess.run(cmd, check=True, timeout=120, capture_output=True)
+
+        img_files = sorted([f for f in os.listdir(img_dir) if f.endswith('.jpg')])
+        if not img_files:
+            shutil.rmtree(img_dir, ignore_errors=True)
+            return False
+
+        rebuild_cmd = [
+            'gs', '-dNOPAUSE', '-dBATCH', '-dQUIET',
+            '-sDEVICE=pdfwrite', '-dCompatibilityLevel=1.4',
+            '-dPDFSETTINGS=/screen',
+            '-dDetectDuplicateImages=true',
+            '-dCompressFonts=true',
+            f'-sOutputFile={output_path}'
+        ] + [os.path.join(img_dir, f) for f in img_files]
+
+        subprocess.run(rebuild_cmd, check=True, timeout=120, capture_output=True)
+
+        try:
+            shutil.rmtree(img_dir, ignore_errors=True)
+        except:
+            pass
+
+        return os.path.exists(output_path) and os.path.getsize(output_path) > 0
+    except Exception as e:
+        print(f'⚠️ Nuclear rebuild failed: {e}', flush=True)
+        return False
+
+
 # ==================== GEMINI HELPER WITH RETRY + FALLBACK ====================
 def generate_gemini_response(client, prompt_text, img, filename=""):
-    """
-    Try multiple Gemini models with retry on 503.
-    Falls back to smaller models if primary is overloaded.
-    """
     import time
     import random
-    
-    # Model priority list (newest to most stable)
+
     models_to_try = [
         'gemini-3.8-flash',
         'gemini-2.5-flash',
         'gemini-2.0-flash',
         'gemini-1.5-flash',
     ]
-    
+
     last_error = None
-    
+
     for model_name in models_to_try:
-        for attempt in range(3):  # 3 attempts per model with backoff
+        for attempt in range(3):
             try:
                 print(f'🤖 Trying {model_name} (attempt {attempt+1}/3) for {filename}...', flush=True)
-                
                 response = client.models.generate_content(
                     model=model_name,
                     contents=[prompt_text, img]
                 )
-                
                 text = response.text.strip()
                 print(f'✅ Success with {model_name}', flush=True)
                 return text, model_name
-                
             except Exception as e:
                 error_str = str(e)
                 last_error = error_str
-                
-                # 503 / UNAVAILABLE → wait and retry same model
+
                 if '503' in error_str or 'UNAVAILABLE' in error_str or 'high demand' in error_str or 'overloaded' in error_str:
                     wait_time = (2 ** attempt) + random.uniform(0, 1)
-                    print(f'⚠️ {model_name} overloaded (503). Waiting {wait_time:.1f}s...', flush=True)
+                    print(f'⚠️ {model_name} overloaded. Waiting {wait_time:.1f}s...', flush=True)
                     time.sleep(wait_time)
                     continue
-                
-                # 404 / model not found → skip to next model
                 elif '404' in error_str or 'NOT_FOUND' in error_str or 'no longer available' in error_str:
-                    print(f'⚠️ {model_name} not available. Trying next model...', flush=True)
+                    print(f'⚠️ {model_name} not available. Next model...', flush=True)
                     break
-                
-                # 429 / quota → skip to next model
                 elif '429' in error_str or 'quota' in error_str.lower() or 'RESOURCE_EXHAUSTED' in error_str:
-                    print(f'⚠️ {model_name} quota exceeded. Trying next model...', flush=True)
+                    print(f'⚠️ {model_name} quota exceeded. Next model...', flush=True)
                     break
-                
-                # Other error (API key, safety, etc.) → raise immediately
                 else:
                     print(f'❌ {model_name} error: {error_str[:200]}', flush=True)
                     raise e
-        
-        print(f'⚠️ {model_name} failed. Moving to next model...', flush=True)
-    
-    # All models failed
-    raise Exception(f'All AI models are currently busy. Please try again in 1-2 minutes. (Last error: {last_error[:200]})')
+        print(f'⚠️ {model_name} failed. Next model...', flush=True)
+
+    raise Exception(f'All AI models are busy. Please try again in 1-2 minutes.')
 
 
 # ==================== ROUTES ====================
@@ -223,18 +250,19 @@ def health():
     return {
         'status': 'ok',
         'service': 'bharat24tools-api',
-        'version': '9.3',
+        'version': '9.4',
         'tools': 24,
         'ocr_engine': 'gemini-3.8-flash (with fallback)',
         'sdk': 'google-genai',
         'gemini_configured': bool(os.environ.get('GEMINI_API_KEY', '').strip()),
         'max_files_ocr': 3,
+        'compression_range': '50KB - 2GB',
         'fallback_models': ['gemini-3.8-flash', 'gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-1.5-flash'],
         'auto_cleanup': True
     }
 
 
-# ========== 1. COMPRESS PDF ==========
+# ========== 1. COMPRESS PDF (Progressive 50KB minimum) ==========
 @app.route('/compress', methods=['POST'])
 def compress():
     if not processing_lock.acquire(timeout=300):
@@ -265,6 +293,12 @@ def compress():
         except:
             target_size = 0
 
+        # MINIMUM LIMIT: 50 KB (50 * 1024 bytes)
+        MIN_TARGET = 50 * 1024
+        if target_size > 0 and target_size < MIN_TARGET:
+            print(f'⚠️ Target {target_size/1024:.1f}KB too small. Setting to minimum 50KB.', flush=True)
+            target_size = MIN_TARGET
+
         PRESETS = {
             'extreme': {'dpi': 50, 'quality': 30, 'pdf_settings': '/screen'},
             'recommended': {'dpi': 72, 'quality': 70, 'pdf_settings': '/ebook'},
@@ -288,7 +322,7 @@ def compress():
 
         jpeg_q = max(10, min(100, use_quality))
 
-        def build_gs_cmd(inp, outp, dpi_val, jpeg_quality, pdf_settings):
+        def build_gs_cmd(inp, outp, dpi_val, jpeg_quality, pdf_settings, gray=False):
             cmd = [
                 'gs', '-sDEVICE=pdfwrite',
                 '-dCompatibilityLevel=1.4',
@@ -302,12 +336,13 @@ def compress():
                 '-dDownsampleMonoImages=true',
                 f'-dMonoImageResolution={dpi_val}',
                 f'-dJPEGQ={jpeg_quality}',
+                '-dAutoRotatePages=/None',
             ]
             if compress_fonts:
                 cmd.append('-dCompressFonts=true')
             if font_subset:
                 cmd.append('-dSubsetFonts=true')
-            if grayscale:
+            if gray or grayscale:
                 cmd.append('-sColorConversionStrategy=Gray')
                 cmd.append('-dProcessColorModel=/DeviceGray')
             cmd.append(f'-sOutputFile={outp}')
@@ -316,11 +351,20 @@ def compress():
 
         method_used = preset
         target_hit = ''
+        best_output = None
+        best_size = input_size
+        output_path = os.path.join(temp_dir, 'output.pdf')
 
         if target_size > 0 and target_size < input_size:
             print(f'🎯 Target: {target_size/1024:.1f}KB (original: {input_size/1024:.1f}KB)', flush=True)
 
+            # ==================== LEVEL 1-3: Progressive Ghostscript ====================
             attempts = [
+                (10, 5, '/screen', 'molecular'),
+                (15, 8, '/screen', 'nuclear'),
+                (20, 10, '/screen', 'super-extreme'),
+                (25, 15, '/screen', 'hyper-aggressive'),
+                (30, 20, '/screen', 'extreme-plus'),
                 (40, 25, '/screen', 'ultra-aggressive'),
                 (50, 30, '/screen', 'extreme'),
                 (60, 40, '/screen', 'very-aggressive'),
@@ -333,41 +377,94 @@ def compress():
                 (200, 90, '/prepress', 'max-quality'),
             ]
 
-            best_output = None
-            best_size = 0
-
             for i, (a_dpi, a_q, a_settings, a_label) in enumerate(attempts):
-                output_path = os.path.join(temp_dir, f'attempt-{i}.pdf')
+                if best_size <= target_size:
+                    break
+                attempt_path = os.path.join(temp_dir, f'attempt-{i}.pdf')
                 try:
-                    cmd = build_gs_cmd(input_path, output_path, a_dpi, a_q, a_settings)
+                    cmd = build_gs_cmd(input_path, attempt_path, a_dpi, a_q, a_settings)
                     subprocess.run(cmd, check=True, timeout=60, capture_output=True)
-
-                    if os.path.exists(output_path):
-                        out_size = os.path.getsize(output_path)
-                        print(f'  Attempt {i+1} ({a_label}): {out_size/1024:.1f}KB', flush=True)
-
-                        if out_size <= target_size:
-                            best_output = output_path
+                    if os.path.exists(attempt_path):
+                        out_size = os.path.getsize(attempt_path)
+                        print(f'  [{i+1}] {a_label}: {out_size/1024:.1f}KB', flush=True)
+                        if out_size < best_size:
+                            best_output = attempt_path
                             best_size = out_size
                             method_used = a_label
+                        if out_size <= target_size:
                             target_hit = f'{out_size/1024:.1f}KB'
-                            print(f'  ✅ Target hit with {a_label}', flush=True)
+                            print(f'  ✅ Target hit with {a_label}!', flush=True)
                             break
-                        else:
-                            if best_output is None or out_size < best_size:
-                                best_output = output_path
-                                best_size = out_size
-                                method_used = a_label
                 except Exception as e:
-                    print(f'  ⚠️ Attempt {i+1} failed: {e}', flush=True)
+                    print(f'  ⚠️ {a_label} failed: {e}', flush=True)
                     continue
 
+            # ==================== LEVEL 4: Nuclear Color ====================
+            if best_size > target_size:
+                print(f'💣 LEVEL 4: Nuclear rebuild from images...', flush=True)
+                nuclear_options = [
+                    (50, 20, 'nuclear-50dpi'),
+                    (40, 15, 'nuclear-40dpi'),
+                    (35, 10, 'nuclear-35dpi'),
+                    (30, 8, 'nuclear-30dpi'),
+                    (25, 8, 'nuclear-25dpi'),
+                    (20, 5, 'nuclear-20dpi'),
+                ]
+                for n_dpi, n_q, n_label in nuclear_options:
+                    if best_size <= target_size:
+                        break
+                    nuclear_path = os.path.join(temp_dir, f'{n_label}.pdf')
+                    try:
+                        if rebuild_pdf_from_images(input_path, nuclear_path, dpi=n_dpi, jpeg_q=n_q, grayscale=False):
+                            n_size = os.path.getsize(nuclear_path)
+                            print(f'  💣 {n_label}: {n_size/1024:.1f}KB', flush=True)
+                            if n_size < best_size:
+                                best_output = nuclear_path
+                                best_size = n_size
+                                method_used = n_label
+                            if n_size <= target_size:
+                                target_hit = f'{n_size/1024:.1f}KB'
+                                print(f'  ✅ Target hit with {n_label}!', flush=True)
+                                break
+                    except Exception as e:
+                        print(f'  ⚠️ {n_label} failed: {e}', flush=True)
+                        continue
+
+            # ==================== LEVEL 5: Nuclear Grayscale (Last Resort) ====================
+            if best_size > target_size:
+                print(f'⚫ LEVEL 5: Grayscale nuclear (last resort)...', flush=True)
+                gray_options = [
+                    (25, 8, 'gray-25dpi'),
+                    (20, 5, 'gray-20dpi'),
+                    (15, 5, 'gray-15dpi'),
+                    (12, 4, 'gray-12dpi'),
+                    (10, 3, 'gray-10dpi'),
+                ]
+                for g_dpi, g_q, g_label in gray_options:
+                    if best_size <= target_size:
+                        break
+                    gray_path = os.path.join(temp_dir, f'{g_label}.pdf')
+                    try:
+                        if rebuild_pdf_from_images(input_path, gray_path, dpi=g_dpi, jpeg_q=g_q, grayscale=True):
+                            g_size = os.path.getsize(gray_path)
+                            print(f'  ⚫ {g_label}: {g_size/1024:.1f}KB', flush=True)
+                            if g_size < best_size:
+                                best_output = gray_path
+                                best_size = g_size
+                                method_used = g_label
+                            if g_size <= target_size:
+                                target_hit = f'{g_size/1024:.1f}KB'
+                                print(f'  ✅ Target hit with {g_label}!', flush=True)
+                                break
+                    except Exception as e:
+                        print(f'  ⚠️ {g_label} failed: {e}', flush=True)
+                        continue
+
             if best_output and os.path.exists(best_output):
-                output_path = os.path.join(temp_dir, 'output.pdf')
                 shutil.copy(best_output, output_path)
                 if target_hit == '':
                     target_hit = f'best-effort ({best_size/1024:.1f}KB)'
-                    print(f'  ⚠️ Target not fully hit, using best: {best_size/1024:.1f}KB', flush=True)
+                    print(f'  ⚠️ Target not fully hit. Minimum possible: {best_size/1024:.1f}KB', flush=True)
             else:
                 return 'Compression failed', 500
 
@@ -382,7 +479,6 @@ def compress():
 
             out_size = os.path.getsize(output_path)
             if out_size >= input_size * 0.95:
-                print(f'⚠️ Size didn\'t reduce much ({out_size/1024:.1f}KB), trying aggressive...', flush=True)
                 retry_path = os.path.join(temp_dir, 'retry.pdf')
                 aggressive = build_gs_cmd(input_path, retry_path, 50, 30, '/screen')
                 try:
@@ -390,14 +486,13 @@ def compress():
                     if os.path.exists(retry_path) and os.path.getsize(retry_path) < out_size:
                         shutil.copy(retry_path, output_path)
                         method_used = 'auto-aggressive'
-                        print(f'✅ Aggressive retry worked: {os.path.getsize(retry_path)/1024:.1f}KB', flush=True)
                 except:
                     pass
 
         output_size = os.path.getsize(output_path)
         saved = ((input_size - output_size) / input_size * 100) if input_size > 0 else 0
 
-        print(f'✅ Compress done: {input_size/1024:.1f}KB → {output_size/1024:.1f}KB ({saved:.1f}% saved)', flush=True)
+        print(f'✅ Final: {input_size/1024:.1f}KB → {output_size/1024:.1f}KB ({saved:.1f}% saved) | method={method_used} | target={target_hit}', flush=True)
 
         response = send_file(
             output_path,
@@ -407,7 +502,9 @@ def compress():
         )
         response.headers['X-Compression-Method'] = method_used
         response.headers['X-Target-Hit'] = target_hit
-        response.headers['Access-Control-Expose-Headers'] = 'X-Compression-Method, X-Target-Hit'
+        response.headers['X-Original-Size'] = str(input_size)
+        response.headers['X-Final-Size'] = str(output_size)
+        response.headers['Access-Control-Expose-Headers'] = 'X-Compression-Method, X-Target-Hit, X-Original-Size, X-Final-Size'
         return response
 
     except subprocess.TimeoutExpired:
@@ -488,7 +585,6 @@ def jpg_to_pdf():
                 return f'File {i+1}: {msg}', 400
             path = os.path.join(temp_dir, f'img-{i:03d}{os.path.splitext(file.filename)[1].lower()}')
             file.save(path)
-
             img = Image.open(path)
             if img.mode in ('RGBA', 'LA', 'P'):
                 background = Image.new('RGB', img.size, (255, 255, 255))
@@ -499,20 +595,13 @@ def jpg_to_pdf():
                 img = background
             elif img.mode != 'RGB':
                 img = img.convert('RGB')
-
             images.append(img)
 
         if not images:
             return 'No valid images', 400
 
         output_path = os.path.join(temp_dir, 'output.pdf')
-        images[0].save(
-            output_path,
-            'PDF',
-            save_all=True,
-            append_images=images[1:],
-            resolution=100.0
-        )
+        images[0].save(output_path, 'PDF', save_all=True, append_images=images[1:], resolution=100.0)
 
         if not os.path.exists(output_path):
             return 'PDF creation failed', 500
@@ -722,58 +811,38 @@ def excel_to_pdf():
             return text
 
         def escape_xml(text):
-            return (str(text)
-                    .replace('&', '&amp;')
-                    .replace('<', '&lt;')
-                    .replace('>', '&gt;'))
+            return (str(text).replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;'))
 
         wb = None
         load_success = False
-
         try:
             wb = load_workbook(input_path, data_only=True, read_only=True)
             load_success = True
-        except Exception as e1:
-            print(f'⚠️ read_only failed: {e1}', flush=True)
-
+        except:
+            pass
         if not load_success:
             try:
                 wb = load_workbook(input_path, data_only=True, read_only=False)
                 load_success = True
-            except Exception as e2:
-                print(f'⚠️ normal failed: {e2}', flush=True)
-
+            except:
+                pass
         if not load_success:
             try:
-                wb = load_workbook(input_path, data_only=True, read_only=True,
-                                   keep_vba=False, keep_links=False)
+                wb = load_workbook(input_path, data_only=True, read_only=True, keep_vba=False, keep_links=False)
                 load_success = True
-            except Exception as e3:
-                print(f'❌ All modes failed: {e3}', flush=True)
-
+            except:
+                pass
         if not load_success or wb is None:
             return 'Cannot read this Excel file.', 400
 
-        pdf = SimpleDocTemplate(
-            output_path,
-            pagesize=landscape(A4),
-            leftMargin=10*mm, rightMargin=10*mm,
-            topMargin=25*mm, bottomMargin=18*mm,
-            title='Excel to PDF - Bharat24Tools',
-            author='Bharat24Tools'
-        )
-
+        pdf = SimpleDocTemplate(output_path, pagesize=landscape(A4), leftMargin=10*mm, rightMargin=10*mm, topMargin=25*mm, bottomMargin=18*mm, title='Excel to PDF', author='Bharat24Tools')
         styles = getSampleStyleSheet()
         title_style = ParagraphStyle('BrandTitle', parent=styles['Heading1'], fontSize=18, textColor=colors.HexColor('#a855f7'), alignment=TA_LEFT, spaceAfter=4, fontName='Helvetica-Bold')
         subtitle_style = ParagraphStyle('BrandSubtitle', parent=styles['Normal'], fontSize=9, textColor=colors.HexColor('#666666'), alignment=TA_LEFT, spaceAfter=12, fontName='Helvetica-Oblique')
         sheet_style = ParagraphStyle('SheetTitle', parent=styles['Heading2'], fontSize=13, textColor=colors.HexColor('#533483'), spaceBefore=8, spaceAfter=8, fontName='Helvetica-Bold')
 
-        story = []
-        story.append(Paragraph('⚡ Bharat24Tools', title_style))
-        story.append(Paragraph(
-            f'Excel to PDF &nbsp;•&nbsp; File: {escape_xml(file.filename)} &nbsp;•&nbsp; {datetime.now().strftime("%d %b %Y, %I:%M %p")}',
-            subtitle_style
-        ))
+        story = [Paragraph('⚡ Bharat24Tools', title_style)]
+        story.append(Paragraph(f'Excel to PDF &nbsp;•&nbsp; File: {escape_xml(file.filename)} &nbsp;•&nbsp; {datetime.now().strftime("%d %b %Y, %I:%M %p")}', subtitle_style))
         story.append(Spacer(1, 6))
 
         total_rows_converted = 0
@@ -786,7 +855,6 @@ def excel_to_pdf():
                 sheet = wb[sheet_name]
             except:
                 continue
-
             raw_data = []
             try:
                 for row in sheet.iter_rows(values_only=True):
@@ -802,34 +870,24 @@ def excel_to_pdf():
                         continue
             except:
                 continue
-
-            if not raw_data or len(raw_data) < 1:
+            if not raw_data:
                 continue
-
             header = raw_data[0]
             while len(header) < MAX_COLS:
                 header.append('')
-
-            col_types = []
-            for col_idx in range(len(header)):
-                col_values = [row[col_idx] for row in raw_data[1:51] if col_idx < len(row)]
-                col_types.append(detect_column_type(col_values))
-
+            col_types = [detect_column_type([row[i] for row in raw_data[1:51] if i < len(row)]) for i in range(len(header))]
             if total_sheets > 1:
                 story.append(Paragraph(f'📄 Sheet {sheet_idx + 1}: {escape_xml(sheet_name)}', sheet_style))
             else:
                 story.append(Paragraph(f'📄 Sheet: {escape_xml(sheet_name)}', sheet_style))
-
             display_data = []
             for row in raw_data:
                 display_row = [smart_truncate(c, 50) for c in row]
                 while len(display_row) < len(header):
                     display_row.append('')
                 display_data.append(display_row)
-
             col_widths = calculate_column_widths(display_data)
             pdf_table = Table(display_data, colWidths=col_widths, repeatRows=1)
-
             table_styles = [
                 ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#a855f7')),
                 ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
@@ -837,18 +895,11 @@ def excel_to_pdf():
                 ('FONTSIZE', (0, 0), (-1, 0), 9),
                 ('ALIGN', (0, 0), (-1, 0), 'CENTER'),
                 ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
-                ('TOPPADDING', (0, 0), (-1, 0), 7),
-                ('BOTTOMPADDING', (0, 0), (-1, 0), 7),
                 ('FONTSIZE', (0, 1), (-1, -1), 8),
-                ('TOPPADDING', (0, 1), (-1, -1), 5),
-                ('BOTTOMPADDING', (0, 1), (-1, -1), 5),
-                ('LEFTPADDING', (0, 0), (-1, -1), 5),
-                ('RIGHTPADDING', (0, 0), (-1, -1), 5),
                 ('GRID', (0, 0), (-1, -1), 0.4, colors.HexColor('#d1d5db')),
                 ('BOX', (0, 0), (-1, -1), 1, colors.HexColor('#a855f7')),
                 ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#f8f5ff')]),
             ]
-
             for col_idx, ctype in enumerate(col_types):
                 if ctype in ('number', 'currency', 'percent'):
                     table_styles.append(('ALIGN', (col_idx, 1), (col_idx, -1), 'RIGHT'))
@@ -856,16 +907,12 @@ def excel_to_pdf():
                     table_styles.append(('ALIGN', (col_idx, 1), (col_idx, -1), 'CENTER'))
                 else:
                     table_styles.append(('ALIGN', (col_idx, 1), (col_idx, -1), 'LEFT'))
-
             pdf_table.setStyle(TableStyle(table_styles))
             story.append(pdf_table)
             story.append(Spacer(1, 8))
-
             data_rows = len(display_data) - 1
             story.append(Paragraph(f'<font size="8" color="#666666">✓ {data_rows} rows • {len(header)} columns</font>', styles['Normal']))
-
             total_rows_converted += data_rows
-
             if sheet_idx < total_sheets - 1:
                 story.append(PageBreak())
 
@@ -895,16 +942,9 @@ def excel_to_pdf():
             canvas.restoreState()
 
         pdf.build(story, onFirstPage=add_page_decorations, onLaterPages=add_page_decorations)
-
         print(f'✅ Excel to PDF: {total_sheets} sheets, {total_rows_converted} rows', flush=True)
 
-        return send_file(
-            output_path,
-            mimetype='application/pdf',
-            as_attachment=True,
-            download_name=f'Bharat24Tools_{file.filename.rsplit(".", 1)[0]}.pdf'
-        )
-
+        return send_file(output_path, mimetype='application/pdf', as_attachment=True, download_name=f'Bharat24Tools_{file.filename.rsplit(".", 1)[0]}.pdf')
     except Exception as e:
         import traceback
         traceback.print_exc()
@@ -932,10 +972,7 @@ def pdf_to_excel():
         txt_path = os.path.join(temp_dir, 'extracted.txt')
         output_path = os.path.join(temp_dir, 'output.xlsx')
         file.save(input_path)
-        subprocess.run([
-            'gs', '-sDEVICE=txtwrite', '-dNOPAUSE', '-dBATCH', '-dQUIET',
-            f'-sOutputFile={txt_path}', input_path
-        ], check=True, timeout=PROCESSING_TIMEOUT, capture_output=True)
+        subprocess.run(['gs', '-sDEVICE=txtwrite', '-dNOPAUSE', '-dBATCH', '-dQUIET', f'-sOutputFile={txt_path}', input_path], check=True, timeout=PROCESSING_TIMEOUT, capture_output=True)
         if not os.path.exists(txt_path):
             return 'Text extraction failed', 500
         with open(txt_path, 'r', encoding='utf-8', errors='ignore') as f:
@@ -960,7 +997,6 @@ def pdf_to_excel():
                 row += 1
         ws.column_dimensions['A'].width = 100
         wb.save(output_path)
-        print(f'✅ PDF to Excel: {os.path.getsize(output_path)} bytes', flush=True)
         return send_file(output_path, mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', as_attachment=True, download_name='converted.xlsx')
     except Exception as e:
         print(f'❌ PDF to Excel error: {e}', flush=True)
@@ -1015,7 +1051,6 @@ def excel_to_image():
         plt.title('Excel Content — Bharat24Tools', fontsize=14, fontweight='bold', pad=20)
         plt.savefig(output_path, dpi=150, bbox_inches='tight', facecolor='white')
         plt.close()
-        print(f'✅ Excel to Image: {os.path.getsize(output_path)} bytes', flush=True)
         return send_file(output_path, mimetype='image/png', as_attachment=True, download_name='excel-image.png')
     except Exception as e:
         print(f'❌ Excel to Image error: {e}', flush=True)
@@ -1048,13 +1083,10 @@ def merge_pdf():
             file.save(path)
             pdf_paths.append(path)
         output_path = os.path.join(temp_dir, 'merged.pdf')
-        cmd = ['gs', '-sDEVICE=pdfwrite', '-dNOPAUSE', '-dBATCH', '-dQUIET',
-               '-dCompatibilityLevel=1.4',
-               f'-sOutputFile={output_path}'] + pdf_paths
+        cmd = ['gs', '-sDEVICE=pdfwrite', '-dNOPAUSE', '-dBATCH', '-dQUIET', '-dCompatibilityLevel=1.4', f'-sOutputFile={output_path}'] + pdf_paths
         subprocess.run(cmd, check=True, timeout=PROCESSING_TIMEOUT, capture_output=True)
         if not os.path.exists(output_path):
             return 'Merge failed', 500
-        print(f'✅ Merged {len(pdf_paths)} PDFs', flush=True)
         return send_file(output_path, mimetype='application/pdf', as_attachment=True, download_name='merged.pdf')
     except Exception as e:
         print(f'❌ Merge error: {e}', flush=True)
@@ -1093,7 +1125,6 @@ def split_pdf():
         pdf_files = sorted([f for f in os.listdir(temp_dir) if f.startswith('page-') and f.endswith('.pdf')])
         if not pdf_files:
             return 'Split failed', 500
-        print(f'✅ Split: {len(pdf_files)} pages', flush=True)
         if len(pdf_files) == 1:
             return send_file(os.path.join(temp_dir, pdf_files[0]), mimetype='application/pdf', as_attachment=True, download_name='page-1.pdf')
         zip_buffer = io.BytesIO()
@@ -1144,7 +1175,6 @@ def rotate_pdf():
         subprocess.run(['qpdf', f'--rotate={rotate_spec}', input_path, output_path], check=True, timeout=PROCESSING_TIMEOUT, capture_output=True)
         if not os.path.exists(output_path):
             return 'Rotation failed', 500
-        print(f'✅ Rotated {angle}°', flush=True)
         return send_file(output_path, mimetype='application/pdf', as_attachment=True, download_name='rotated.pdf')
     except Exception as e:
         print(f'❌ Rotate error: {e}', flush=True)
@@ -1176,7 +1206,6 @@ def protect_pdf():
         subprocess.run(['qpdf', '--encrypt', password, password, '256', '--', input_path, output_path], check=True, timeout=PROCESSING_TIMEOUT, capture_output=True)
         if not os.path.exists(output_path):
             return 'Encryption failed', 500
-        print(f'✅ Protected', flush=True)
         return send_file(output_path, mimetype='application/pdf', as_attachment=True, download_name='protected.pdf')
     except Exception as e:
         print(f'❌ Protect error: {e}', flush=True)
@@ -1208,7 +1237,6 @@ def unlock_pdf():
         subprocess.run(['qpdf', f'--password={password}', '--decrypt', input_path, output_path], check=True, timeout=PROCESSING_TIMEOUT, capture_output=True)
         if not os.path.exists(output_path):
             return 'Unlock failed', 500
-        print(f'✅ Unlocked', flush=True)
         return send_file(output_path, mimetype='application/pdf', as_attachment=True, download_name='unlocked.pdf')
     except Exception as e:
         print(f'❌ Unlock error: {e}', flush=True)
@@ -1241,7 +1269,6 @@ def heic_to_jpg():
         if img.mode != 'RGB':
             img = img.convert('RGB')
         img.save(output_path, 'JPEG', quality=90)
-        print(f'✅ HEIC to JPG: {os.path.getsize(output_path)} bytes', flush=True)
         return send_file(output_path, mimetype='image/jpeg', as_attachment=True, download_name='converted.jpg')
     except Exception as e:
         print(f'❌ HEIC error: {e}', flush=True)
@@ -1276,7 +1303,6 @@ def webp_to_jpg():
         elif img.mode != 'RGB':
             img = img.convert('RGB')
         img.save(output_path, 'JPEG', quality=92)
-        print(f'✅ WebP to JPG: {os.path.getsize(output_path)} bytes', flush=True)
         return send_file(output_path, mimetype='image/jpeg', as_attachment=True, download_name='converted.jpg')
     except Exception as e:
         print(f'❌ WebP error: {e}', flush=True)
@@ -1310,7 +1336,6 @@ def image_upscaler():
         new_size = (img.width * scale, img.height * scale)
         upscaled = img.resize(new_size, Image.LANCZOS)
         upscaled.save(output_path, 'PNG')
-        print(f'✅ Upscaled {scale}x', flush=True)
         return send_file(output_path, mimetype='image/png', as_attachment=True, download_name='upscaled.png')
     except Exception as e:
         print(f'❌ Upscaler error: {e}', flush=True)
@@ -1344,7 +1369,6 @@ def ocr():
         output_path = os.path.join(temp_dir, 'output.txt')
         with open(output_path, 'w', encoding='utf-8') as f:
             f.write(text)
-        print(f'✅ OCR: {len(text)} chars', flush=True)
         return send_file(output_path, mimetype='text/plain', as_attachment=True, download_name='extracted.txt')
     except Exception as e:
         print(f'❌ OCR error: {e}', flush=True)
@@ -1385,7 +1409,6 @@ def image_to_sketch():
         inverted_blur = cv2.bitwise_not(blurred)
         sketch = cv2.divide(gray, inverted_blur, scale=256.0)
         cv2.imwrite(output_path, sketch)
-        print(f'✅ Sketch created', flush=True)
         return send_file(output_path, mimetype='image/png', as_attachment=True, download_name='sketch.png')
     except Exception as e:
         print(f'❌ Sketch error: {e}', flush=True)
@@ -1425,7 +1448,6 @@ def gif_maker():
         output_path = os.path.join(temp_dir, 'animation.gif')
         duration = int(request.form.get('duration', '200'))
         images[0].save(output_path, 'GIF', save_all=True, append_images=images[1:], duration=duration, loop=0, optimize=True)
-        print(f'✅ GIF created: {len(images)} frames', flush=True)
         return send_file(output_path, mimetype='image/gif', as_attachment=True, download_name='animation.gif')
     except Exception as e:
         print(f'❌ GIF error: {e}', flush=True)
@@ -1484,11 +1506,7 @@ Rules:
         results = []
 
         for idx, file in enumerate(files):
-            valid, msg = validate_file(
-                file,
-                allowed_ext=['.jpg', '.jpeg', '.png', '.webp', '.bmp', '.tiff', '.tif'],
-                max_size=15 * 1024 * 1024
-            )
+            valid, msg = validate_file(file, allowed_ext=['.jpg', '.jpeg', '.png', '.webp', '.bmp', '.tiff', '.tif'], max_size=15 * 1024 * 1024)
             if not valid:
                 return f'File {idx+1} ({file.filename}): {msg}', 400
 
@@ -1505,7 +1523,6 @@ Rules:
                     ratio = max_dim / max(img.size)
                     img = img.resize((int(img.width * ratio), int(img.height * ratio)), Image.LANCZOS)
 
-                # ⬇️ USING FALLBACK HELPER
                 text, model_used = generate_gemini_response(client, prompt_text, img, file.filename)
                 print(f'✅ Used model: {model_used}', flush=True)
 
@@ -1553,13 +1570,11 @@ Rules:
                     cols = max(len(r) for r in rows)
                     if cols == 0:
                         continue
-
                     tbl = doc.add_table(rows=len(rows), cols=cols)
                     try:
                         tbl.style = 'Light Grid Accent 1'
                     except:
                         tbl.style = 'Table Grid'
-
                     for r_idx, row in enumerate(rows):
                         for c_idx in range(cols):
                             cell_text = row[c_idx] if c_idx < len(row) else ''
@@ -1570,7 +1585,6 @@ Rules:
                                     run.font.size = Pt(10)
                                     if r_idx == 0:
                                         run.font.bold = True
-
                     try:
                         from docx.oxml.ns import qn
                         from docx.oxml import OxmlElement
@@ -1585,7 +1599,6 @@ Rules:
                                     run.font.color.rgb = RGBColor(0xFF, 0xFF, 0xFF)
                     except:
                         pass
-
                     if t_idx < len(tables) - 1:
                         doc.add_paragraph()
 
@@ -1623,24 +1636,14 @@ Rules:
 
         if len(results) == 1:
             base_name, output_path = results[0]
-            return send_file(
-                output_path,
-                mimetype='application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-                as_attachment=True,
-                download_name=f'Bharat24Tools_AI_{base_name}.docx'
-            )
+            return send_file(output_path, mimetype='application/vnd.openxmlformats-officedocument.wordprocessingml.document', as_attachment=True, download_name=f'Bharat24Tools_AI_{base_name}.docx')
 
         zip_buffer = io.BytesIO()
         with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
             for base_name, path in results:
                 zf.write(path, f'{base_name}.docx')
         zip_buffer.seek(0)
-        return send_file(
-            zip_buffer,
-            mimetype='application/zip',
-            as_attachment=True,
-            download_name=f'Bharat24Tools_AI_{datetime.now().strftime("%Y%m%d_%H%M")}.zip'
-        )
+        return send_file(zip_buffer, mimetype='application/zip', as_attachment=True, download_name=f'Bharat24Tools_AI_{datetime.now().strftime("%Y%m%d_%H%M")}.zip')
 
     except Exception as e:
         import traceback
@@ -1700,11 +1703,7 @@ Rules:
         results = []
 
         for idx, file in enumerate(files):
-            valid, msg = validate_file(
-                file,
-                allowed_ext=['.jpg', '.jpeg', '.png', '.webp', '.bmp', '.tiff', '.tif'],
-                max_size=15 * 1024 * 1024
-            )
+            valid, msg = validate_file(file, allowed_ext=['.jpg', '.jpeg', '.png', '.webp', '.bmp', '.tiff', '.tif'], max_size=15 * 1024 * 1024)
             if not valid:
                 return f'File {idx+1} ({file.filename}): {msg}', 400
 
@@ -1721,7 +1720,6 @@ Rules:
                     ratio = max_dim / max(img.size)
                     img = img.resize((int(img.width * ratio), int(img.height * ratio)), Image.LANCZOS)
 
-                # ⬇️ USING FALLBACK HELPER
                 text, model_used = generate_gemini_response(client, prompt_text, img, file.filename)
                 print(f'✅ Used model: {model_used}', flush=True)
 
@@ -1744,25 +1742,16 @@ Rules:
                 wb = Workbook()
                 ws = wb.active
                 ws.title = 'Extracted Data'
-
-                thin = Border(
-                    left=Side(style='thin', color='CCCCCC'),
-                    right=Side(style='thin', color='CCCCCC'),
-                    top=Side(style='thin', color='CCCCCC'),
-                    bottom=Side(style='thin', color='CCCCCC')
-                )
-
+                thin = Border(left=Side(style='thin', color='CCCCCC'), right=Side(style='thin', color='CCCCCC'), top=Side(style='thin', color='CCCCCC'), bottom=Side(style='thin', color='CCCCCC'))
                 current_row = 1
 
                 for t_idx, table_data in enumerate(tables):
                     rows = table_data.get('rows', [])
                     if not rows:
                         continue
-
                     cols = max(len(r) for r in rows) if rows else 0
                     if cols == 0:
                         continue
-
                     if len(tables) > 1:
                         title_cell = ws.cell(row=current_row, column=1, value=f'📄 {table_data.get("name", f"Table {t_idx+1}")}')
                         title_cell.font = Font(bold=True, size=12, color='FFFFFF')
@@ -1771,9 +1760,7 @@ Rules:
                         ws.merge_cells(start_row=current_row, start_column=1, end_row=current_row, end_column=max(cols, 3))
                         ws.row_dimensions[current_row].height = 26
                         current_row += 2
-
                     data_start = current_row
-
                     for r_idx, row in enumerate(rows):
                         for c_idx in range(cols):
                             val = row[c_idx] if c_idx < len(row) else ''
@@ -1785,7 +1772,6 @@ Rules:
                                 cell.fill = PatternFill('solid', fgColor='A855F7')
                             elif r_idx % 2 == 0:
                                 cell.fill = PatternFill('solid', fgColor='F8F5FF')
-
                     for c_idx in range(cols):
                         col_letter = get_column_letter(c_idx + 1)
                         max_len = 12
@@ -1793,7 +1779,6 @@ Rules:
                             if c_idx < len(rows[r_idx]):
                                 max_len = max(max_len, min(len(str(rows[r_idx][c_idx])), 55))
                         ws.column_dimensions[col_letter].width = max_len
-
                     current_row = data_start + len(rows) + 2
 
                 base_name = os.path.splitext(file.filename)[0]
@@ -1814,24 +1799,14 @@ Rules:
 
         if len(results) == 1:
             base_name, output_path = results[0]
-            return send_file(
-                output_path,
-                mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-                as_attachment=True,
-                download_name=f'Bharat24Tools_AI_{base_name}.xlsx'
-            )
+            return send_file(output_path, mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', as_attachment=True, download_name=f'Bharat24Tools_AI_{base_name}.xlsx')
 
         zip_buffer = io.BytesIO()
         with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
             for base_name, path in results:
                 zf.write(path, f'{base_name}.xlsx')
         zip_buffer.seek(0)
-        return send_file(
-            zip_buffer,
-            mimetype='application/zip',
-            as_attachment=True,
-            download_name=f'Bharat24Tools_AI_{datetime.now().strftime("%Y%m%d_%H%M")}.zip'
-        )
+        return send_file(zip_buffer, mimetype='application/zip', as_attachment=True, download_name=f'Bharat24Tools_AI_{datetime.now().strftime("%Y%m%d_%H%M")}.zip')
 
     except Exception as e:
         import traceback
@@ -1887,7 +1862,6 @@ def pdf_watermark():
             writer.add_page(page)
         with open(output_path, 'wb') as f:
             writer.write(f)
-        print(f'✅ Watermark added', flush=True)
         return send_file(output_path, mimetype='application/pdf', as_attachment=True, download_name='watermarked.pdf')
     except Exception as e:
         print(f'❌ Watermark error: {e}', flush=True)
@@ -1936,7 +1910,6 @@ def pdf_page_delete():
                 kept += 1
         with open(output_path, 'wb') as f:
             writer.write(f)
-        print(f'✅ Deleted {len(delete_pages)} pages', flush=True)
         return send_file(output_path, mimetype='application/pdf', as_attachment=True, download_name='pages-deleted.pdf')
     except Exception as e:
         print(f'❌ Page Delete error: {e}', flush=True)
