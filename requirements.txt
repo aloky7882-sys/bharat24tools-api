@@ -13,4 +13,4 @@ pillow-heif==0.15.0
 pytesseract==0.3.10
 opencv-python-headless==4.9.0.80
 numpy==1.26.4
-google-generativeai==0.8.3
+google-genai==0.3.0

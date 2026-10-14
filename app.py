@@ -65,7 +65,7 @@ HTML = '''
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Bharat24Tools API v9.0</title>
+    <title>Bharat24Tools API v9.1</title>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <style>
         * { margin:0; padding:0; box-sizing:border-box; font-family:Arial,sans-serif; }
@@ -82,7 +82,7 @@ HTML = '''
 </head>
 <body>
     <div class="container">
-        <h1>⚡ Bharat24Tools API v9.0</h1>
+        <h1>⚡ Bharat24Tools API v9.1</h1>
         <p class="status-badge">Server is running ✅ — 24 Tools Active</p>
 
         <div class="section-title">📄 PDF Tools (13)</div>
@@ -108,12 +108,12 @@ HTML = '''
         <div class="endpoint"><code>POST /avif-to-jpg</code><span class="desc">AVIF to JPG</span></div>
         <div class="endpoint"><code>POST /image-to-sketch</code><span class="desc">Image to Sketch</span></div>
         <div class="endpoint"><code>POST /gif-maker</code><span class="desc">GIF Maker</span></div>
-        <div class="endpoint"><code>POST /image-to-word</code><span class="desc">Image to Word ✅ Gemini AI 3 Files</span></div>
-        <div class="endpoint"><code>POST /image-to-excel</code><span class="desc">Image to Excel ✅ Gemini AI 3 Files</span></div>
+        <div class="endpoint"><code>POST /image-to-word</code><span class="desc">Image to Word ✅ Gemini 2.0 AI</span></div>
+        <div class="endpoint"><code>POST /image-to-excel</code><span class="desc">Image to Excel ✅ Gemini 2.0 AI</span></div>
         <div class="endpoint"><code>POST /pdf-watermark</code><span class="desc">PDF Watermark</span></div>
         <div class="endpoint"><code>POST /pdf-page-delete</code><span class="desc">PDF Page Delete</span></div>
 
-        <p class="footer">Version 9.0 — 24 Tools | AI-Powered OCR (Max 3 Files)</p>
+        <p class="footer">Version 9.1 — 24 Tools | AI-Powered OCR (New SDK, Max 3 Files)</p>
     </div>
 </body>
 </html>
@@ -158,9 +158,10 @@ def health():
     return {
         'status': 'ok',
         'service': 'bharat24tools-api',
-        'version': '9.0',
+        'version': '9.1',
         'tools': 24,
-        'ocr_engine': 'gemini-1.5-flash',
+        'ocr_engine': 'gemini-2.0-flash',
+        'sdk': 'google-genai',
         'gemini_configured': bool(os.environ.get('GEMINI_API_KEY', '').strip()),
         'max_files_ocr': 3,
         'auto_cleanup': True
@@ -1368,7 +1369,7 @@ def gif_maker():
         cleanup_dir(temp_dir)
 
 
-# ========== 21. IMAGE TO WORD (Gemini AI, Max 3 Files) ==========
+# ========== 21. IMAGE TO WORD (Gemini AI - New SDK) ==========
 @app.route('/image-to-word', methods=['POST'])
 def image_to_word():
     if not processing_lock.acquire(timeout=300):
@@ -1390,9 +1391,9 @@ def image_to_word():
 
         custom_title = request.form.get('title', 'Extracted Text')[:60]
 
-        import google.generativeai as genai
-        import json
+        from google import genai
         from PIL import Image
+        import json
         from docx import Document
         from docx.shared import Pt, RGBColor, Cm
         from docx.enum.text import WD_ALIGN_PARAGRAPH
@@ -1402,10 +1403,9 @@ def image_to_word():
         if not api_key:
             return 'Server not configured. Contact admin.', 500
 
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel('gemini-1.5-flash')
+        client = genai.Client(api_key=api_key)
 
-        prompt = """Extract ALL text from this image, preserving structure.
+        prompt_text = """Extract ALL text from this image, preserving structure.
 Return ONLY valid JSON, no explanation, no markdown:
 {"tables":[{"rows":[["cell1","cell2"],["cell3","cell4"]]}],"plain_text":"any text outside tables"}
 Rules:
@@ -1440,7 +1440,11 @@ Rules:
                     img = img.resize((int(img.width * ratio), int(img.height * ratio)), Image.LANCZOS)
 
                 print(f'🤖 Gemini processing {file.filename}...', flush=True)
-                response = model.generate_content([prompt, img])
+
+                response = client.models.generate_content(
+                    model='gemini-2.0-flash',
+                    contents=[prompt_text, img]
+                )
                 text = response.text.strip()
 
                 if text.startswith('```'):
@@ -1547,8 +1551,10 @@ Rules:
                 print(f'✅ {file.filename} done ({len(tables)} tables)', flush=True)
 
             except Exception as e:
+                import traceback
+                traceback.print_exc()
                 print(f'❌ File {file.filename} error: {e}', flush=True)
-                continue
+                return f'AI Error ({file.filename}): {str(e)[:300]}', 500
 
         if not results:
             return 'No content extracted from any file.', 400
@@ -1584,7 +1590,7 @@ Rules:
         cleanup_dir(temp_dir)
 
 
-# ========== 22. IMAGE TO EXCEL (Gemini AI, Max 3 Files) ==========
+# ========== 22. IMAGE TO EXCEL (Gemini AI - New SDK) ==========
 @app.route('/image-to-excel', methods=['POST'])
 def image_to_excel():
     if not processing_lock.acquire(timeout=300):
@@ -1604,9 +1610,9 @@ def image_to_excel():
         if len(files) > 3:
             return 'Max 3 files allowed per request', 400
 
-        import google.generativeai as genai
-        import json
+        from google import genai
         from PIL import Image
+        import json
         from openpyxl import Workbook
         from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
         from openpyxl.utils import get_column_letter
@@ -1616,10 +1622,9 @@ def image_to_excel():
         if not api_key:
             return 'Server not configured. Contact admin.', 500
 
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel('gemini-1.5-flash')
+        client = genai.Client(api_key=api_key)
 
-        prompt = """Extract ALL table data from this image.
+        prompt_text = """Extract ALL table data from this image.
 Return ONLY valid JSON, no explanation, no markdown:
 {"tables":[{"name":"Table 1","rows":[["cell1","cell2"],["cell3","cell4"]]}]}
 Rules:
@@ -1655,7 +1660,11 @@ Rules:
                     img = img.resize((int(img.width * ratio), int(img.height * ratio)), Image.LANCZOS)
 
                 print(f'🤖 Gemini processing {file.filename}...', flush=True)
-                response = model.generate_content([prompt, img])
+
+                response = client.models.generate_content(
+                    model='gemini-2.0-flash',
+                    contents=[prompt_text, img]
+                )
                 text = response.text.strip()
 
                 if text.startswith('```'):
@@ -1668,13 +1677,11 @@ Rules:
                 try:
                     data = json.loads(text)
                 except:
-                    print(f'⚠️ {file.filename}: AI parse failed', flush=True)
-                    continue
+                    return f'AI could not parse {file.filename}. Try clearer image.', 400
 
                 tables = data.get('tables', [])
                 if not tables:
-                    print(f'⚠️ {file.filename}: no tables found', flush=True)
-                    continue
+                    return f'No table data found in {file.filename}.', 400
 
                 wb = Workbook()
                 ws = wb.active
@@ -1739,8 +1746,10 @@ Rules:
                 print(f'✅ {file.filename} done ({len(tables)} tables)', flush=True)
 
             except Exception as e:
+                import traceback
+                traceback.print_exc()
                 print(f'❌ File {file.filename} error: {e}', flush=True)
-                continue
+                return f'AI Error ({file.filename}): {str(e)[:300]}', 500
 
         if not results:
             return 'No table data extracted from any file.', 400
