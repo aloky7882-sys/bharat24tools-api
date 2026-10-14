@@ -65,7 +65,7 @@ HTML = '''
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Bharat24Tools API v9.1</title>
+    <title>Bharat24Tools API v9.2</title>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <style>
         * { margin:0; padding:0; box-sizing:border-box; font-family:Arial,sans-serif; }
@@ -82,7 +82,7 @@ HTML = '''
 </head>
 <body>
     <div class="container">
-        <h1>⚡ Bharat24Tools API v9.1</h1>
+        <h1>⚡ Bharat24Tools API v9.2</h1>
         <p class="status-badge">Server is running ✅ — 24 Tools Active</p>
 
         <div class="section-title">📄 PDF Tools (13)</div>
@@ -108,12 +108,12 @@ HTML = '''
         <div class="endpoint"><code>POST /avif-to-jpg</code><span class="desc">AVIF to JPG</span></div>
         <div class="endpoint"><code>POST /image-to-sketch</code><span class="desc">Image to Sketch</span></div>
         <div class="endpoint"><code>POST /gif-maker</code><span class="desc">GIF Maker</span></div>
-        <div class="endpoint"><code>POST /image-to-word</code><span class="desc">Image to Word ✅ Gemini 2.0 AI</span></div>
-        <div class="endpoint"><code>POST /image-to-excel</code><span class="desc">Image to Excel ✅ Gemini 2.0 AI</span></div>
+        <div class="endpoint"><code>POST /image-to-word</code><span class="desc">Image to Word ✅ Gemini 3.8 AI</span></div>
+        <div class="endpoint"><code>POST /image-to-excel</code><span class="desc">Image to Excel ✅ Gemini 3.8 AI</span></div>
         <div class="endpoint"><code>POST /pdf-watermark</code><span class="desc">PDF Watermark</span></div>
         <div class="endpoint"><code>POST /pdf-page-delete</code><span class="desc">PDF Page Delete</span></div>
 
-        <p class="footer">Version 9.1 — 24 Tools | AI-Powered OCR (New SDK, Max 3 Files)</p>
+        <p class="footer">Version 9.2 — 24 Tools | AI-Powered OCR (New SDK, Max 3 Files)</p>
     </div>
 </body>
 </html>
@@ -158,9 +158,9 @@ def health():
     return {
         'status': 'ok',
         'service': 'bharat24tools-api',
-        'version': '9.1',
+        'version': '9.2',
         'tools': 24,
-        'ocr_engine': 'gemini-2.0-flash',
+        'ocr_engine': 'gemini-3.8-flash',
         'sdk': 'google-genai',
         'gemini_configured': bool(os.environ.get('GEMINI_API_KEY', '').strip()),
         'max_files_ocr': 3,
@@ -1369,7 +1369,7 @@ def gif_maker():
         cleanup_dir(temp_dir)
 
 
-# ========== 21. IMAGE TO WORD (Gemini AI - New SDK) ==========
+# ========== 21. IMAGE TO WORD (Gemini AI - gemini-3.8-flash) ==========
 @app.route('/image-to-word', methods=['POST'])
 def image_to_word():
     if not processing_lock.acquire(timeout=300):
@@ -1442,7 +1442,7 @@ Rules:
                 print(f'🤖 Gemini processing {file.filename}...', flush=True)
 
                 response = client.models.generate_content(
-                    model='gemini-2.0-flash',
+                    model='gemini-3.8-flash',
                     contents=[prompt_text, img]
                 )
                 text = response.text.strip()
@@ -1590,7 +1590,7 @@ Rules:
         cleanup_dir(temp_dir)
 
 
-# ========== 22. IMAGE TO EXCEL (Gemini AI - New SDK) ==========
+# ========== 22. IMAGE TO EXCEL (Gemini AI - gemini-3.8-flash) ==========
 @app.route('/image-to-excel', methods=['POST'])
 def image_to_excel():
     if not processing_lock.acquire(timeout=300):
@@ -1662,7 +1662,7 @@ Rules:
                 print(f'🤖 Gemini processing {file.filename}...', flush=True)
 
                 response = client.models.generate_content(
-                    model='gemini-2.0-flash',
+                    model='gemini-3.8-flash',
                     contents=[prompt_text, img]
                 )
                 text = response.text.strip()
