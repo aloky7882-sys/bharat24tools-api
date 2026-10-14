@@ -65,7 +65,7 @@ HTML = '''
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Bharat24Tools API v9.2</title>
+    <title>Bharat24Tools API v9.3</title>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <style>
         * { margin:0; padding:0; box-sizing:border-box; font-family:Arial,sans-serif; }
@@ -82,7 +82,7 @@ HTML = '''
 </head>
 <body>
     <div class="container">
-        <h1>⚡ Bharat24Tools API v9.2</h1>
+        <h1>⚡ Bharat24Tools API v9.3</h1>
         <p class="status-badge">Server is running ✅ — 24 Tools Active</p>
 
         <div class="section-title">📄 PDF Tools (13)</div>
@@ -108,12 +108,12 @@ HTML = '''
         <div class="endpoint"><code>POST /avif-to-jpg</code><span class="desc">AVIF to JPG</span></div>
         <div class="endpoint"><code>POST /image-to-sketch</code><span class="desc">Image to Sketch</span></div>
         <div class="endpoint"><code>POST /gif-maker</code><span class="desc">GIF Maker</span></div>
-        <div class="endpoint"><code>POST /image-to-word</code><span class="desc">Image to Word ✅ Gemini 3.8 AI</span></div>
-        <div class="endpoint"><code>POST /image-to-excel</code><span class="desc">Image to Excel ✅ Gemini 3.8 AI</span></div>
+        <div class="endpoint"><code>POST /image-to-word</code><span class="desc">Image to Word ✅ AI + Fallback</span></div>
+        <div class="endpoint"><code>POST /image-to-excel</code><span class="desc">Image to Excel ✅ AI + Fallback</span></div>
         <div class="endpoint"><code>POST /pdf-watermark</code><span class="desc">PDF Watermark</span></div>
         <div class="endpoint"><code>POST /pdf-page-delete</code><span class="desc">PDF Page Delete</span></div>
 
-        <p class="footer">Version 9.2 — 24 Tools | AI-Powered OCR (New SDK, Max 3 Files)</p>
+        <p class="footer">Version 9.3 — 24 Tools | AI-Powered OCR (Fallback System)</p>
     </div>
 </body>
 </html>
@@ -147,6 +147,71 @@ def validate_file(file, allowed_ext=None, max_size=MAX_FILE_SIZE):
     return True, 'OK'
 
 
+# ==================== GEMINI HELPER WITH RETRY + FALLBACK ====================
+def generate_gemini_response(client, prompt_text, img, filename=""):
+    """
+    Try multiple Gemini models with retry on 503.
+    Falls back to smaller models if primary is overloaded.
+    """
+    import time
+    import random
+    
+    # Model priority list (newest to most stable)
+    models_to_try = [
+        'gemini-3.8-flash',
+        'gemini-2.5-flash',
+        'gemini-2.0-flash',
+        'gemini-1.5-flash',
+    ]
+    
+    last_error = None
+    
+    for model_name in models_to_try:
+        for attempt in range(3):  # 3 attempts per model with backoff
+            try:
+                print(f'🤖 Trying {model_name} (attempt {attempt+1}/3) for {filename}...', flush=True)
+                
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=[prompt_text, img]
+                )
+                
+                text = response.text.strip()
+                print(f'✅ Success with {model_name}', flush=True)
+                return text, model_name
+                
+            except Exception as e:
+                error_str = str(e)
+                last_error = error_str
+                
+                # 503 / UNAVAILABLE → wait and retry same model
+                if '503' in error_str or 'UNAVAILABLE' in error_str or 'high demand' in error_str or 'overloaded' in error_str:
+                    wait_time = (2 ** attempt) + random.uniform(0, 1)
+                    print(f'⚠️ {model_name} overloaded (503). Waiting {wait_time:.1f}s...', flush=True)
+                    time.sleep(wait_time)
+                    continue
+                
+                # 404 / model not found → skip to next model
+                elif '404' in error_str or 'NOT_FOUND' in error_str or 'no longer available' in error_str:
+                    print(f'⚠️ {model_name} not available. Trying next model...', flush=True)
+                    break
+                
+                # 429 / quota → skip to next model
+                elif '429' in error_str or 'quota' in error_str.lower() or 'RESOURCE_EXHAUSTED' in error_str:
+                    print(f'⚠️ {model_name} quota exceeded. Trying next model...', flush=True)
+                    break
+                
+                # Other error (API key, safety, etc.) → raise immediately
+                else:
+                    print(f'❌ {model_name} error: {error_str[:200]}', flush=True)
+                    raise e
+        
+        print(f'⚠️ {model_name} failed. Moving to next model...', flush=True)
+    
+    # All models failed
+    raise Exception(f'All AI models are currently busy. Please try again in 1-2 minutes. (Last error: {last_error[:200]})')
+
+
 # ==================== ROUTES ====================
 @app.route('/')
 def index():
@@ -158,12 +223,13 @@ def health():
     return {
         'status': 'ok',
         'service': 'bharat24tools-api',
-        'version': '9.2',
+        'version': '9.3',
         'tools': 24,
-        'ocr_engine': 'gemini-3.8-flash',
+        'ocr_engine': 'gemini-3.8-flash (with fallback)',
         'sdk': 'google-genai',
         'gemini_configured': bool(os.environ.get('GEMINI_API_KEY', '').strip()),
         'max_files_ocr': 3,
+        'fallback_models': ['gemini-3.8-flash', 'gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-1.5-flash'],
         'auto_cleanup': True
     }
 
@@ -1369,7 +1435,7 @@ def gif_maker():
         cleanup_dir(temp_dir)
 
 
-# ========== 21. IMAGE TO WORD (Gemini AI - gemini-3.8-flash) ==========
+# ========== 21. IMAGE TO WORD (Gemini AI + Fallback) ==========
 @app.route('/image-to-word', methods=['POST'])
 def image_to_word():
     if not processing_lock.acquire(timeout=300):
@@ -1439,13 +1505,9 @@ Rules:
                     ratio = max_dim / max(img.size)
                     img = img.resize((int(img.width * ratio), int(img.height * ratio)), Image.LANCZOS)
 
-                print(f'🤖 Gemini processing {file.filename}...', flush=True)
-
-                response = client.models.generate_content(
-                    model='gemini-3.8-flash',
-                    contents=[prompt_text, img]
-                )
-                text = response.text.strip()
+                # ⬇️ USING FALLBACK HELPER
+                text, model_used = generate_gemini_response(client, prompt_text, img, file.filename)
+                print(f'✅ Used model: {model_used}', flush=True)
 
                 if text.startswith('```'):
                     parts = text.split('```')
@@ -1590,7 +1652,7 @@ Rules:
         cleanup_dir(temp_dir)
 
 
-# ========== 22. IMAGE TO EXCEL (Gemini AI - gemini-3.8-flash) ==========
+# ========== 22. IMAGE TO EXCEL (Gemini AI + Fallback) ==========
 @app.route('/image-to-excel', methods=['POST'])
 def image_to_excel():
     if not processing_lock.acquire(timeout=300):
@@ -1659,13 +1721,9 @@ Rules:
                     ratio = max_dim / max(img.size)
                     img = img.resize((int(img.width * ratio), int(img.height * ratio)), Image.LANCZOS)
 
-                print(f'🤖 Gemini processing {file.filename}...', flush=True)
-
-                response = client.models.generate_content(
-                    model='gemini-3.8-flash',
-                    contents=[prompt_text, img]
-                )
-                text = response.text.strip()
+                # ⬇️ USING FALLBACK HELPER
+                text, model_used = generate_gemini_response(client, prompt_text, img, file.filename)
+                print(f'✅ Used model: {model_used}', flush=True)
 
                 if text.startswith('```'):
                     parts = text.split('```')
