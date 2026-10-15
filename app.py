@@ -18,6 +18,7 @@ MAX_FILE_SIZE = 20 * 1024 * 1024
 MAX_FILES_COUNT = 20
 PROCESSING_TIMEOUT = 120
 CLEANUP_DELAY = 30
+ATTEMPT_TIMEOUT = 20          # ✅ NEW: per-attempt timeout 60 → 20 sec
 
 processing_lock = threading.Lock()
 
@@ -60,7 +61,7 @@ HTML = '''
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Bharat24Tools API v9.6</title>
+    <title>Bharat24Tools API v9.7</title>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <style>
         * { margin:0; padding:0; box-sizing:border-box; font-family:Arial,sans-serif; }
@@ -77,10 +78,10 @@ HTML = '''
 </head>
 <body>
     <div class="container">
-        <h1>⚡ Bharat24Tools API v9.6</h1>
+        <h1>⚡ Bharat24Tools API v9.7</h1>
         <p class="status-badge">Server is running ✅ — 24 Tools Active</p>
         <div class="section-title">📄 PDF Tools (13)</div>
-        <div class="endpoint"><code>POST /compress</code><span class="desc">Compress PDF ✅ Smart (100KB min)</span></div>
+        <div class="endpoint"><code>POST /compress</code><span class="desc">Compress PDF ✅ Smart (4 attempts, 20s each)</span></div>
         <div class="endpoint"><code>POST /pdf-to-jpg</code><span class="desc">PDF to Images</span></div>
         <div class="endpoint"><code>POST /jpg-to-pdf</code><span class="desc">Images to PDF</span></div>
         <div class="endpoint"><code>POST /pdf-to-word</code><span class="desc">PDF to Word</span></div>
@@ -104,7 +105,7 @@ HTML = '''
         <div class="endpoint"><code>POST /image-to-excel</code><span class="desc">Image to Excel ✅ AI + Fallback</span></div>
         <div class="endpoint"><code>POST /pdf-watermark</code><span class="desc">PDF Watermark</span></div>
         <div class="endpoint"><code>POST /pdf-page-delete</code><span class="desc">PDF Page Delete</span></div>
-        <p class="footer">Version 9.6 — 24 Tools | Smart Compression (100KB min)</p>
+        <p class="footer">Version 9.7 — 24 Tools | Fast Smart Compression (100KB min)</p>
     </div>
 </body>
 </html>
@@ -176,7 +177,7 @@ def health():
     return {
         'status': 'ok',
         'service': 'bharat24tools-api',
-        'version': '9.6',
+        'version': '9.7',
         'tools': 24,
         'ocr_engine': 'gemini-3.8-flash (with fallback)',
         'sdk': 'google-genai',
@@ -184,10 +185,12 @@ def health():
         'max_files_ocr': 3,
         'compression_range': '100KB - 2GB',
         'fallback_models': ['gemini-3.8-flash', 'gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-1.5-flash'],
-        'auto_cleanup': True
+        'auto_cleanup': True,
+        'compress_attempts': 4,
+        'attempt_timeout': ATTEMPT_TIMEOUT
     }
 
-# ========== 1. COMPRESS PDF (Smart, No Nuclear) ==========
+# ========== 1. COMPRESS PDF (Fast Smart: 4 attempts, 20s each) ==========
 @app.route('/compress', methods=['POST'])
 def compress():
     if not processing_lock.acquire(timeout=300):
@@ -268,34 +271,24 @@ def compress():
         if target_size > 0 and target_size < input_size:
             print(f'🎯 Target: {target_size/1024:.1f}KB (original: {input_size/1024:.1f}KB)', flush=True)
 
+            # ✅ NEW: 4 escalating attempts (moderate → aggressive → very → extreme)
             attempts = [
-                (10, 5, '/screen', 'molecular'),
-                (15, 8, '/screen', 'nuclear'),
-                (20, 10, '/screen', 'super-extreme'),
-                (25, 15, '/screen', 'hyper-aggressive'),
-                (30, 20, '/screen', 'extreme-plus'),
-                (40, 25, '/screen', 'ultra-aggressive'),
-                (50, 30, '/screen', 'extreme'),
-                (60, 40, '/screen', 'very-aggressive'),
-                (72, 50, '/ebook', 'aggressive'),
-                (72, 60, '/ebook', 'strong'),
-                (72, 70, '/ebook', 'recommended'),
-                (100, 75, '/ebook', 'balanced'),
-                (120, 80, '/printer', 'high'),
-                (150, 85, '/printer', 'very-high'),
-                (200, 90, '/prepress', 'max-quality'),
+                (72, 50, '/ebook',  'moderate'),
+                (50, 30, '/screen', 'aggressive'),
+                (30, 15, '/screen', 'very-aggressive'),
+                (20, 10, '/screen', 'extreme'),
             ]
 
             for i, (a_dpi, a_q, a_settings, a_label) in enumerate(attempts):
                 if best_size <= target_size:
-                    break
+                    break  # ✅ target hit → stop immediately
                 attempt_path = os.path.join(temp_dir, f'attempt-{i}.pdf')
                 try:
                     cmd = build_gs_cmd(input_path, attempt_path, a_dpi, a_q, a_settings)
-                    subprocess.run(cmd, check=True, timeout=60, capture_output=True)
+                    subprocess.run(cmd, check=True, timeout=ATTEMPT_TIMEOUT, capture_output=True)  # ✅ 20s
                     if os.path.exists(attempt_path):
                         out_size = os.path.getsize(attempt_path)
-                        print(f'  [{i+1}] {a_label}: {out_size/1024:.1f}KB', flush=True)
+                        print(f'  [{i+1}/4] {a_label} (dpi={a_dpi}, q={a_q}): {out_size/1024:.1f}KB', flush=True)
                         if out_size < best_size:
                             best_output = attempt_path
                             best_size = out_size
@@ -304,6 +297,9 @@ def compress():
                             target_hit = f'{out_size/1024:.1f}KB'
                             print(f'  ✅ Target hit with {a_label}!', flush=True)
                             break
+                except subprocess.TimeoutExpired:
+                    print(f'  ⏱️ {a_label} timed out after {ATTEMPT_TIMEOUT}s. Next...', flush=True)
+                    continue
                 except Exception as e:
                     print(f'  ⚠️ {a_label} failed: {e}', flush=True)
                     continue
@@ -546,7 +542,6 @@ def excel_to_pdf():
         from reportlab.lib.units import mm
         from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, PageBreak
         from reportlab.lib import colors
-        from reportlab.lib.enums import TA_CENTER, TA_LEFT
         from datetime import datetime
 
         def clean_cell(value):
@@ -556,18 +551,6 @@ def excel_to_pdf():
                 if s.lower() == 'nan' or s.lower() == 'none': return ''
                 return s.strip()
             except: return ''
-
-        def detect_column_type(values):
-            non_empty = [v for v in values if v and str(v).strip()]
-            if not non_empty: return 'text'
-            num_count = 0
-            for v in non_empty:
-                clean = str(v).replace(',', '').replace('₹', '').replace('$', '').replace('%', '').strip()
-                try:
-                    float(clean); num_count += 1
-                except: pass
-            if num_count / len(non_empty) > 0.7: return 'number'
-            return 'text'
 
         def calc_widths(table_data, max_cols=15):
             if not table_data: return []
