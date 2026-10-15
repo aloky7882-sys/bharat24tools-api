@@ -60,7 +60,7 @@ HTML = '''
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Bharat24Tools API v9.5</title>
+    <title>Bharat24Tools API v9.6</title>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <style>
         * { margin:0; padding:0; box-sizing:border-box; font-family:Arial,sans-serif; }
@@ -77,10 +77,10 @@ HTML = '''
 </head>
 <body>
     <div class="container">
-        <h1>⚡ Bharat24Tools API v9.5</h1>
+        <h1>⚡ Bharat24Tools API v9.6</h1>
         <p class="status-badge">Server is running ✅ — 24 Tools Active</p>
         <div class="section-title">📄 PDF Tools (13)</div>
-        <div class="endpoint"><code>POST /compress</code><span class="desc">Compress PDF ✅ Extreme Nuclear (50KB min)</span></div>
+        <div class="endpoint"><code>POST /compress</code><span class="desc">Compress PDF ✅ Smart (100KB min)</span></div>
         <div class="endpoint"><code>POST /pdf-to-jpg</code><span class="desc">PDF to Images</span></div>
         <div class="endpoint"><code>POST /jpg-to-pdf</code><span class="desc">Images to PDF</span></div>
         <div class="endpoint"><code>POST /pdf-to-word</code><span class="desc">PDF to Word</span></div>
@@ -104,7 +104,7 @@ HTML = '''
         <div class="endpoint"><code>POST /image-to-excel</code><span class="desc">Image to Excel ✅ AI + Fallback</span></div>
         <div class="endpoint"><code>POST /pdf-watermark</code><span class="desc">PDF Watermark</span></div>
         <div class="endpoint"><code>POST /pdf-page-delete</code><span class="desc">PDF Page Delete</span></div>
-        <p class="footer">Version 9.5 — 24 Tools | Extreme Nuclear Compression</p>
+        <p class="footer">Version 9.6 — 24 Tools | Smart Compression (100KB min)</p>
     </div>
 </body>
 </html>
@@ -133,42 +133,6 @@ def validate_file(file, allowed_ext=None, max_size=MAX_FILE_SIZE):
     if size == 0:
         return False, 'File is empty'
     return True, 'OK'
-
-def rebuild_pdf_from_images(input_path, output_path, dpi=50, jpeg_q=15, grayscale=False):
-    try:
-        img_dir = os.path.join(os.path.dirname(output_path), f'nuclear_{int(time.time()*1000)}')
-        os.makedirs(img_dir, exist_ok=True)
-        img_pattern = os.path.join(img_dir, 'page-%04d.jpg')
-        cmd = ['gs', '-dNOPAUSE', '-dBATCH', '-dQUIET', '-dSAFER', '-sDEVICE=jpeg', f'-r{dpi}', f'-dJPEGQ={jpeg_q}', '-dTextAlphaBits=1', '-dGraphicsAlphaBits=1']
-        if grayscale:
-            cmd.extend(['-sColorConversionStrategy=Gray', '-dProcessColorModel=/DeviceGray'])
-        cmd.extend([f'-sOutputFile={img_pattern}', input_path])
-        print(f'  📸 GS convert: dpi={dpi}, q={jpeg_q}, gray={grayscale}', flush=True)
-        result = subprocess.run(cmd, check=True, timeout=180, capture_output=True, text=True)
-        img_files = sorted([f for f in os.listdir(img_dir) if f.endswith('.jpg')])
-        if not img_files:
-            print(f'  ⚠️ No images generated. GS stderr: {result.stderr[:200]}', flush=True)
-            shutil.rmtree(img_dir, ignore_errors=True)
-            return False
-        print(f'  📸 Generated {len(img_files)} images', flush=True)
-        rebuild_cmd = ['gs', '-dNOPAUSE', '-dBATCH', '-dQUIET', '-dSAFER', '-sDEVICE=pdfwrite', '-dCompatibilityLevel=1.4', '-dPDFSETTINGS=/screen', '-dDetectDuplicateImages=true', '-dCompressFonts=true', '-dSubsetFonts=true', '-dAutoRotatePages=/None', '-dDownsampleColorImages=true', f'-dColorImageResolution={dpi}', '-dDownsampleGrayImages=true', f'-dGrayImageResolution={dpi}', f'-sOutputFile={output_path}'] + [os.path.join(img_dir, f) for f in img_files]
-        print(f'  🔨 Rebuilding PDF...', flush=True)
-        subprocess.run(rebuild_cmd, check=True, timeout=180, capture_output=True)
-        try:
-            shutil.rmtree(img_dir, ignore_errors=True)
-        except:
-            pass
-        if os.path.exists(output_path):
-            final_size = os.path.getsize(output_path)
-            print(f'  ✅ Nuclear done: {final_size/1024:.1f}KB', flush=True)
-            return True
-        return False
-    except subprocess.CalledProcessError as e:
-        print(f'  ❌ Nuclear GS error: {e.stderr[:200] if e.stderr else "Unknown"}', flush=True)
-        return False
-    except Exception as e:
-        print(f'  ❌ Nuclear failed: {e}', flush=True)
-        return False
 
 def generate_gemini_response(client, prompt_text, img, filename=""):
     import time as _time
@@ -212,18 +176,18 @@ def health():
     return {
         'status': 'ok',
         'service': 'bharat24tools-api',
-        'version': '9.5',
+        'version': '9.6',
         'tools': 24,
         'ocr_engine': 'gemini-3.8-flash (with fallback)',
         'sdk': 'google-genai',
         'gemini_configured': bool(os.environ.get('GEMINI_API_KEY', '').strip()),
         'max_files_ocr': 3,
-        'compression_range': '50KB - 2GB',
+        'compression_range': '100KB - 2GB',
         'fallback_models': ['gemini-3.8-flash', 'gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-1.5-flash'],
         'auto_cleanup': True
     }
 
-# ========== 1. COMPRESS PDF (Extreme Nuclear — iLovePDF level) ==========
+# ========== 1. COMPRESS PDF (Smart, No Nuclear) ==========
 @app.route('/compress', methods=['POST'])
 def compress():
     if not processing_lock.acquire(timeout=300):
@@ -254,9 +218,9 @@ def compress():
         except:
             target_size = 0
 
-        MIN_TARGET = 50 * 1024
+        MIN_TARGET = 100 * 1024
         if target_size > 0 and target_size < MIN_TARGET:
-            print(f'⚠️ Target {target_size/1024:.1f}KB too small. Setting to minimum 50KB.', flush=True)
+            print(f'⚠️ Target {target_size/1024:.1f}KB too small. Setting to minimum 100KB.', flush=True)
             target_size = MIN_TARGET
 
         PRESETS = {
@@ -343,83 +307,6 @@ def compress():
                 except Exception as e:
                     print(f'  ⚠️ {a_label} failed: {e}', flush=True)
                     continue
-
-            if best_size > target_size:
-                print(f'💣 LEVEL 4: Nuclear rebuild — forcing even for text PDFs...', flush=True)
-                nuclear_options = [
-                    (100, 50, 'nuclear-100dpi'),
-                    (75, 40, 'nuclear-75dpi'),
-                    (60, 30, 'nuclear-60dpi'),
-                    (50, 25, 'nuclear-50dpi'),
-                    (40, 20, 'nuclear-40dpi'),
-                    (35, 15, 'nuclear-35dpi'),
-                    (30, 12, 'nuclear-30dpi'),
-                    (25, 10, 'nuclear-25dpi'),
-                    (20, 8, 'nuclear-20dpi'),
-                    (15, 5, 'nuclear-15dpi'),
-                ]
-                for n_dpi, n_q, n_label in nuclear_options:
-                    if best_size <= target_size:
-                        break
-                    nuclear_path = os.path.join(temp_dir, f'{n_label}.pdf')
-                    try:
-                        success = rebuild_pdf_from_images(input_path, nuclear_path, dpi=n_dpi, jpeg_q=n_q, grayscale=False)
-                        if success and os.path.exists(nuclear_path):
-                            n_size = os.path.getsize(nuclear_path)
-                            print(f'  💣 {n_label}: {n_size/1024:.1f}KB', flush=True)
-                            if n_size < best_size:
-                                if best_output and os.path.exists(best_output) and best_output != nuclear_path:
-                                    try: os.remove(best_output)
-                                    except: pass
-                                best_output = nuclear_path
-                                best_size = n_size
-                                method_used = n_label
-                            if n_size <= target_size:
-                                target_hit = f'{n_size/1024:.1f}KB'
-                                print(f'  ✅ TARGET HIT with {n_label}!', flush=True)
-                                break
-                        else:
-                            print(f'  ⚠️ {n_label} failed silently', flush=True)
-                    except Exception as e:
-                        print(f'  ⚠️ {n_label} exception: {e}', flush=True)
-                        continue
-
-            if best_size > target_size:
-                print(f'⚫ LEVEL 5: Grayscale nuclear — B&W conversion...', flush=True)
-                gray_options = [
-                    (100, 40, 'gray-100dpi'),
-                    (75, 30, 'gray-75dpi'),
-                    (50, 25, 'gray-50dpi'),
-                    (40, 20, 'gray-40dpi'),
-                    (30, 15, 'gray-30dpi'),
-                    (25, 10, 'gray-25dpi'),
-                    (20, 8, 'gray-20dpi'),
-                    (15, 5, 'gray-15dpi'),
-                    (10, 3, 'gray-10dpi'),
-                ]
-                for g_dpi, g_q, g_label in gray_options:
-                    if best_size <= target_size:
-                        break
-                    gray_path = os.path.join(temp_dir, f'{g_label}.pdf')
-                    try:
-                        success = rebuild_pdf_from_images(input_path, gray_path, dpi=g_dpi, jpeg_q=g_q, grayscale=True)
-                        if success and os.path.exists(gray_path):
-                            g_size = os.path.getsize(gray_path)
-                            print(f'  ⚫ {g_label}: {g_size/1024:.1f}KB', flush=True)
-                            if g_size < best_size:
-                                if best_output and os.path.exists(best_output) and best_output != gray_path:
-                                    try: os.remove(best_output)
-                                    except: pass
-                                best_output = gray_path
-                                best_size = g_size
-                                method_used = g_label
-                            if g_size <= target_size:
-                                target_hit = f'{g_size/1024:.1f}KB'
-                                print(f'  ✅ TARGET HIT with {g_label}!', flush=True)
-                                break
-                    except Exception as e:
-                        print(f'  ⚠️ {g_label} exception: {e}', flush=True)
-                        continue
 
             if best_output and os.path.exists(best_output):
                 shutil.copy(best_output, output_path)
@@ -1562,7 +1449,6 @@ def pdf_page_delete():
         from PyPDF2 import PdfReader, PdfWriter
         reader = PdfReader(input_path)
         writer = PdfWriter()
-        total_pages = len(reader.pages)
         for i, page in enumerate(reader.pages):
             if (i + 1) not in delete_pages:
                 writer.add_page(page)
