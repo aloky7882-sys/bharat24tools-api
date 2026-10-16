@@ -18,7 +18,7 @@ MAX_FILE_SIZE = 20 * 1024 * 1024
 MAX_FILES_COUNT = 20
 PROCESSING_TIMEOUT = 120
 CLEANUP_DELAY = 30
-ATTEMPT_TIMEOUT = 20          # ✅ NEW: per-attempt timeout 60 → 20 sec
+ATTEMPT_TIMEOUT = 20
 
 processing_lock = threading.Lock()
 
@@ -61,7 +61,7 @@ HTML = '''
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Bharat24Tools API v9.7</title>
+    <title>Bharat24Tools API v9.8</title>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <style>
         * { margin:0; padding:0; box-sizing:border-box; font-family:Arial,sans-serif; }
@@ -78,7 +78,7 @@ HTML = '''
 </head>
 <body>
     <div class="container">
-        <h1>⚡ Bharat24Tools API v9.7</h1>
+        <h1>⚡ Bharat24Tools API v9.8</h1>
         <p class="status-badge">Server is running ✅ — 24 Tools Active</p>
         <div class="section-title">📄 PDF Tools (13)</div>
         <div class="endpoint"><code>POST /compress</code><span class="desc">Compress PDF ✅ Smart (4 attempts, 20s each)</span></div>
@@ -99,13 +99,13 @@ HTML = '''
         <div class="endpoint"><code>POST /webp-to-jpg</code><span class="desc">WebP to JPG</span></div>
         <div class="endpoint"><code>POST /image-upscaler</code><span class="desc">AI Image Upscaler</span></div>
         <div class="endpoint"><code>POST /ocr</code><span class="desc">OCR Multi-Language</span></div>
-        <div class="endpoint"><code>POST /image-to-sketch</code><span class="desc">Image to Sketch</span></div>
+        <div class="endpoint"><code>POST /image-to-sketch</code><span class="desc">Image to Sketch ✅ 6 Styles + Intensity</span></div>
         <div class="endpoint"><code>POST /gif-maker</code><span class="desc">GIF Maker</span></div>
         <div class="endpoint"><code>POST /image-to-word</code><span class="desc">Image to Word ✅ AI + Fallback</span></div>
         <div class="endpoint"><code>POST /image-to-excel</code><span class="desc">Image to Excel ✅ AI + Fallback</span></div>
         <div class="endpoint"><code>POST /pdf-watermark</code><span class="desc">PDF Watermark</span></div>
         <div class="endpoint"><code>POST /pdf-page-delete</code><span class="desc">PDF Page Delete</span></div>
-        <p class="footer">Version 9.7 — 24 Tools | Fast Smart Compression (100KB min)</p>
+        <p class="footer">Version 9.8 — 24 Tools | Fast Smart Compression + Advanced Sketch</p>
     </div>
 </body>
 </html>
@@ -177,7 +177,7 @@ def health():
     return {
         'status': 'ok',
         'service': 'bharat24tools-api',
-        'version': '9.7',
+        'version': '9.8',
         'tools': 24,
         'ocr_engine': 'gemini-3.8-flash (with fallback)',
         'sdk': 'google-genai',
@@ -187,10 +187,12 @@ def health():
         'fallback_models': ['gemini-3.8-flash', 'gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-1.5-flash'],
         'auto_cleanup': True,
         'compress_attempts': 4,
-        'attempt_timeout': ATTEMPT_TIMEOUT
+        'attempt_timeout': ATTEMPT_TIMEOUT,
+        'sketch_styles': ['pencil', 'charcoal', 'ink', 'colored', 'edge', 'crosshatch'],
+        'sketch_formats': ['png', 'jpg', 'webp']
     }
 
-# ========== 1. COMPRESS PDF (Fast Smart: 4 attempts, 20s each) ==========
+# ========== 1. COMPRESS PDF ==========
 @app.route('/compress', methods=['POST'])
 def compress():
     if not processing_lock.acquire(timeout=300):
@@ -271,7 +273,6 @@ def compress():
         if target_size > 0 and target_size < input_size:
             print(f'🎯 Target: {target_size/1024:.1f}KB (original: {input_size/1024:.1f}KB)', flush=True)
 
-            # ✅ NEW: 4 escalating attempts (moderate → aggressive → very → extreme)
             attempts = [
                 (72, 50, '/ebook',  'moderate'),
                 (50, 30, '/screen', 'aggressive'),
@@ -281,11 +282,11 @@ def compress():
 
             for i, (a_dpi, a_q, a_settings, a_label) in enumerate(attempts):
                 if best_size <= target_size:
-                    break  # ✅ target hit → stop immediately
+                    break
                 attempt_path = os.path.join(temp_dir, f'attempt-{i}.pdf')
                 try:
                     cmd = build_gs_cmd(input_path, attempt_path, a_dpi, a_q, a_settings)
-                    subprocess.run(cmd, check=True, timeout=ATTEMPT_TIMEOUT, capture_output=True)  # ✅ 20s
+                    subprocess.run(cmd, check=True, timeout=ATTEMPT_TIMEOUT, capture_output=True)
                     if os.path.exists(attempt_path):
                         out_size = os.path.getsize(attempt_path)
                         print(f'  [{i+1}/4] {a_label} (dpi={a_dpi}, q={a_q}): {out_size/1024:.1f}KB', flush=True)
@@ -1020,7 +1021,7 @@ def ocr():
 def avif_to_jpg():
     return 'Please use client-side version', 400
 
-# ========== 19. IMAGE TO SKETCH ==========
+# ========== 19. IMAGE TO SKETCH (UPGRADED: 6 styles + intensity + formats) ==========
 @app.route('/image-to-sketch', methods=['POST'])
 def image_to_sketch():
     if not processing_lock.acquire(timeout=300):
@@ -1030,22 +1031,172 @@ def image_to_sketch():
         if 'file' not in request.files:
             return 'No file uploaded', 400
         file = request.files['file']
-        valid, msg = validate_file(file, allowed_ext=['.jpg', '.jpeg', '.png', '.webp'])
-        if not valid: return msg, 400
-        input_path = os.path.join(temp_dir, 'input.png')
-        output_path = os.path.join(temp_dir, 'output.png')
+        valid, msg = validate_file(
+            file,
+            allowed_ext=['.jpg', '.jpeg', '.png', '.webp', '.bmp', '.tiff', '.tif'],
+            max_size=15 * 1024 * 1024
+        )
+        if not valid:
+            return msg, 400
+
+        # ---- Params ----
+        style = (request.form.get('style', 'pencil') or 'pencil').lower()
+        valid_styles = ['pencil', 'charcoal', 'ink', 'colored', 'edge', 'crosshatch']
+        if style not in valid_styles:
+            style = 'pencil'
+
+        try:
+            intensity = int(request.form.get('intensity', '50'))
+        except:
+            intensity = 50
+        intensity = max(1, min(100, intensity))
+
+        out_fmt = (request.form.get('format', 'png') or 'png').lower()
+        if out_fmt == 'jpeg':
+            out_fmt = 'jpg'
+        if out_fmt not in ['png', 'jpg', 'webp']:
+            out_fmt = 'png'
+
+        input_path = os.path.join(temp_dir, 'input.img')
         file.save(input_path)
+
         import cv2
         import numpy as np
-        img = cv2.imread(input_path)
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        inverted = cv2.bitwise_not(gray)
-        blurred = cv2.GaussianBlur(inverted, (21, 21), 0)
-        inverted_blur = cv2.bitwise_not(blurred)
-        sketch = cv2.divide(gray, inverted_blur, scale=256.0)
-        cv2.imwrite(output_path, sketch)
-        return send_file(output_path, mimetype='image/png', as_attachment=True, download_name='sketch.png')
+
+        # Read image safely (handles unicode)
+        try:
+            buf = np.fromfile(input_path, dtype=np.uint8)
+            img = cv2.imdecode(buf, cv2.IMREAD_COLOR)
+        except Exception as e:
+            return f'Cannot read image: {e}', 400
+
+        if img is None:
+            return 'Invalid or unsupported image file.', 400
+
+        h, w = img.shape[:2]
+
+        # Memory safety
+        if h * w > 25_000_000:
+            return 'Image too large (max 25 megapixels).', 400
+
+        # Auto-resize for speed
+        MAX_DIM = 1600
+        if max(h, w) > MAX_DIM:
+            scale = MAX_DIM / max(h, w)
+            img = cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+            print(f'📐 Resized to {img.shape[1]}x{img.shape[0]}', flush=True)
+
+        # Intensity → kernel (1=sharp/high detail → 41; 100=soft/low detail → 3)
+        kernel = int(41 - (intensity * 0.36))
+        if kernel < 3: kernel = 3
+        if kernel % 2 == 0: kernel += 1
+        print(f'🎨 style={style} intensity={intensity} kernel={kernel} fmt={out_fmt}', flush=True)
+
+        # ---- Style processing ----
+        if style == 'pencil':
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            inv = cv2.bitwise_not(gray)
+            blur = cv2.GaussianBlur(inv, (kernel, kernel), 0)
+            sketch = cv2.divide(gray, cv2.bitwise_not(blur), scale=256.0)
+            sketch = cv2.cvtColor(sketch, cv2.COLOR_GRAY2BGR)
+
+        elif style == 'charcoal':
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            inv = cv2.bitwise_not(gray)
+            k2 = min(kernel + 12, 61)
+            if k2 % 2 == 0: k2 += 1
+            blur = cv2.GaussianBlur(inv, (k2, k2), 0)
+            sketch = cv2.divide(gray, cv2.bitwise_not(blur), scale=256.0)
+            sketch = cv2.convertScaleAbs(sketch, alpha=1.4, beta=-40)
+            sketch = cv2.cvtColor(sketch, cv2.COLOR_GRAY2BGR)
+
+        elif style == 'ink':
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            block = 11
+            C = max(2, min(15, int(20 - intensity * 0.15)))
+            sketch = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY, block, C)
+            sketch = cv2.cvtColor(sketch, cv2.COLOR_GRAY2BGR)
+
+        elif style == 'colored':
+            inv = cv2.bitwise_not(img)
+            blur = cv2.GaussianBlur(inv, (kernel, kernel), 0)
+            sketch = cv2.divide(img, cv2.bitwise_not(blur), scale=256.0)
+
+        elif style == 'edge':
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            low = max(10, 60 - intensity // 3)
+            high = min(250, 120 + intensity)
+            edges = cv2.Canny(gray, low, high)
+            edges = cv2.dilate(edges, np.ones((2, 2), np.uint8), iterations=1)
+            sketch = cv2.bitwise_not(edges)
+            sketch = cv2.cvtColor(sketch, cv2.COLOR_GRAY2BGR)
+
+        elif style == 'crosshatch':
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            inv = cv2.bitwise_not(gray)
+            k = kernel if kernel >= 5 else 5
+            # Horizontal blur
+            kern_h = cv2.getGaussianKernel(k, 0).T
+            kern_h = np.repeat(kern_h, k, axis=0)
+            blur_h = cv2.filter2D(inv, -1, kern_h)
+            # Vertical blur
+            kern_v = cv2.getGaussianKernel(k, 0)
+            kern_v = np.repeat(kern_v, k, axis=1)
+            blur_v = cv2.filter2D(inv, -1, kern_v)
+            s1 = cv2.divide(gray, cv2.bitwise_not(blur_h), scale=256.0)
+            s2 = cv2.divide(gray, cv2.bitwise_not(blur_v), scale=256.0)
+            sketch = cv2.min(s1, s2)
+            sketch = cv2.convertScaleAbs(sketch, alpha=1.15, beta=-15)
+            sketch = cv2.cvtColor(sketch, cv2.COLOR_GRAY2BGR)
+
+        else:
+            # fallback pencil
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            inv = cv2.bitwise_not(gray)
+            blur = cv2.GaussianBlur(inv, (kernel, kernel), 0)
+            sketch = cv2.divide(gray, cv2.bitwise_not(blur), scale=256.0)
+            sketch = cv2.cvtColor(sketch, cv2.COLOR_GRAY2BGR)
+
+        # ---- Contrast + sharpen (except binary styles) ----
+        if style not in ['edge', 'ink']:
+            sketch = cv2.convertScaleAbs(sketch, alpha=1.08, beta=-4)
+            gaussian = cv2.GaussianBlur(sketch, (0, 0), 1.4)
+            sketch = cv2.addWeighted(sketch, 1.3, gaussian, -0.3, 0)
+
+        # ---- Save ----
+        ext_map = {'png': '.png', 'jpg': '.jpg', 'webp': '.webp'}
+        mime_map = {'png': 'image/png', 'jpg': 'image/jpeg', 'webp': 'image/webp'}
+        ext = ext_map[out_fmt]
+        mime = mime_map[out_fmt]
+        output_path = os.path.join(temp_dir, f'sketch{ext}')
+
+        if out_fmt == 'jpg':
+            cv2.imwrite(output_path, sketch, [cv2.IMWRITE_JPEG_QUALITY, 92])
+        elif out_fmt == 'webp':
+            cv2.imwrite(output_path, sketch, [cv2.IMWRITE_WEBP_QUALITY, 90])
+        else:
+            cv2.imwrite(output_path, sketch)
+
+        if not os.path.exists(output_path):
+            return 'Sketch creation failed', 500
+
+        out_size = os.path.getsize(output_path)
+        print(f'✅ Sketch ready: {style} / intensity={intensity} / {out_fmt} / {out_size/1024:.1f}KB', flush=True)
+
+        response = send_file(
+            output_path,
+            mimetype=mime,
+            as_attachment=True,
+            download_name=f'sketch-{style}{ext}'
+        )
+        response.headers['X-Sketch-Style'] = style
+        response.headers['X-Sketch-Intensity'] = str(intensity)
+        response.headers['X-Sketch-Format'] = out_fmt
+        response.headers['Access-Control-Expose-Headers'] = 'X-Sketch-Style, X-Sketch-Intensity, X-Sketch-Format'
+        return response
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         print(f'❌ Sketch error: {e}', flush=True)
         return f'Error: {str(e)}', 500
     finally:
@@ -1086,7 +1237,7 @@ def gif_maker():
         processing_lock.release()
         cleanup_dir(temp_dir)
 
-# ========== 21. IMAGE TO WORD (Gemini AI + Fallback) ==========
+# ========== 21. IMAGE TO WORD ==========
 @app.route('/image-to-word', methods=['POST'])
 def image_to_word():
     if not processing_lock.acquire(timeout=300):
@@ -1234,7 +1385,7 @@ Rules:
         processing_lock.release()
         cleanup_dir(temp_dir)
 
-# ========== 22. IMAGE TO EXCEL (Gemini AI + Fallback) ==========
+# ========== 22. IMAGE TO EXCEL ==========
 @app.route('/image-to-excel', methods=['POST'])
 def image_to_excel():
     if not processing_lock.acquire(timeout=300):
