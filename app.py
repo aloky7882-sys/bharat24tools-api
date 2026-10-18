@@ -10,7 +10,6 @@ import zipfile
 import io
 import re
 import glob
-from PIL import Image
 
 app = Flask(__name__)
 CORS(app)
@@ -82,7 +81,7 @@ HTML = '''
         <h1>⚡ Bharat24Tools API v9.9</h1>
         <p class="status-badge">Server is running ✅ — 24 Tools Active</p>
         <div class="section-title">📄 PDF Tools (13)</div>
-        <div class="endpoint"><code>POST /compress</code><span class="desc">Compress PDF ✅ AI Extreme Mode (10KB min)</span></div>
+        <div class="endpoint"><code>POST /compress</code><span class="desc">Compress PDF ✅ AI Scanner Mode (10KB Min)</span></div>
         <div class="endpoint"><code>POST /pdf-to-jpg</code><span class="desc">PDF to Images</span></div>
         <div class="endpoint"><code>POST /jpg-to-pdf</code><span class="desc">Images to PDF</span></div>
         <div class="endpoint"><code>POST /pdf-to-word</code><span class="desc">PDF to Word</span></div>
@@ -106,7 +105,7 @@ HTML = '''
         <div class="endpoint"><code>POST /image-to-excel</code><span class="desc">Image to Excel ✅ AI + Fallback</span></div>
         <div class="endpoint"><code>POST /pdf-watermark</code><span class="desc">PDF Watermark</span></div>
         <div class="endpoint"><code>POST /pdf-page-delete</code><span class="desc">PDF Page Delete</span></div>
-        <p class="footer">Version 9.9 — 24 Tools | AI Extreme Compression (10KB min)</p>
+        <p class="footer">Version 9.9 — 24 Tools | AI Scanner Compression</p>
     </div>
 </body>
 </html>
@@ -187,13 +186,11 @@ def health():
         'compression_range': '10KB - 2GB',
         'fallback_models': ['gemini-3.8-flash', 'gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-1.5-flash'],
         'auto_cleanup': True,
-        'compress_attempts': 4,
-        'attempt_timeout': ATTEMPT_TIMEOUT,
         'sketch_styles': ['pencil', 'charcoal', 'ink', 'colored', 'edge', 'crosshatch'],
         'sketch_formats': ['png', 'jpg', 'webp']
     }
 
-# ========== 1. COMPRESS PDF (Advanced AI Level) ==========
+# ========== 1. COMPRESS PDF (ADVANCED AI SCANNER MODE) ==========
 @app.route('/compress', methods=['POST'])
 def compress():
     if not processing_lock.acquire(timeout=300):
@@ -211,6 +208,7 @@ def compress():
         file.save(input_path)
         input_size = os.path.getsize(input_path)
 
+        preset = request.form.get('preset', 'extreme')
         target_bytes = request.form.get('target_bytes', '').strip()
         grayscale = request.form.get('grayscale', 'no') == 'yes'
         
@@ -219,13 +217,12 @@ def compress():
         except:
             target_size = 0
 
-        # AI Level: Minimum 10KB Support
-        MIN_TARGET = 10 * 1024 
+        MIN_TARGET = 10 * 1024 # 10KB minimum
         if target_size > 0 and target_size < MIN_TARGET:
             target_size = MIN_TARGET
 
         output_path = os.path.join(temp_dir, 'output.pdf')
-        method_used = "Standard AI"
+        method_used = "Standard"
         target_hit = ""
 
         # ==================================================
@@ -234,29 +231,36 @@ def compress():
         if target_size > 0 and target_size < input_size:
             print(f'🎯 Target: {target_size/1024:.1f}KB (Original: {input_size/1024:.1f}KB)', flush=True)
             
-            # SMART ROUTING: Agar target aggressive hai (<25%), direct Rasterization (Scanner Mode) on karo
+            # SMART ROUTING: Agar target original size ka 25% se kam hai (e.g. 2MB -> 100KB)
+            # Toh direct Scanner Mode on karo.
             if target_size < (input_size * 0.25):
                 print("⚡ Extreme size detected. Activating AI Scanner Mode...", flush=True)
                 
-                min_dpi, max_dpi = 10, 60
+                min_dpi, max_dpi = 10, 50
                 attempts = 0
+                jpg_files = []
                 
                 while attempts < 4: # Max 4 attempts for speed
                     attempts += 1
                     current_dpi = (min_dpi + max_dpi) // 2
                     
+                    # Cleanup previous JPGs
+                    for f in glob.glob(f'{temp_dir}/page-*.jpg'): os.remove(f)
+                    
+                    # 1. Convert PDF pages to JPEGs
                     jpg_pattern = f'{temp_dir}/page-%03d.jpg'
-                    for f in glob.glob(jpg_pattern): os.remove(f)
-                        
+                    color_strategy = '-sColorConversionStrategy=Gray' if grayscale else '-sColorConversionStrategy=RGB'
+                    
                     subprocess.run([
                         'gs', '-dNOPAUSE', '-dBATCH', '-dQUIET', '-sDEVICE=jpeg', 
-                        f'-r{current_dpi}', '-dJPEGQ=40', 
+                        f'-r{current_dpi}', '-dJPEGQ=30', color_strategy,
                         f'-sOutputFile={jpg_pattern}', input_path
                     ], check=True, timeout=15, capture_output=True)
                     
                     jpg_files = sorted(glob.glob(jpg_pattern))
                     if not jpg_files: break
                     
+                    # 2. Convert JPEGs back to PDF using Ghostscript
                     raster_path = os.path.join(temp_dir, f'raster_{attempts}.pdf')
                     subprocess.run([
                         'gs', '-sDEVICE=pdfwrite', '-dCompatibilityLevel=1.4', 
@@ -275,25 +279,60 @@ def compress():
                     else:
                         max_dpi = current_dpi - 2 
                         
+                # Fallback agar loop fail ho jaye
                 if not os.path.exists(output_path) and jpg_files:
                     shutil.copy(raster_path, output_path)
                     target_hit = f'Closest ({os.path.getsize(output_path)/1024:.1f}KB)'
                     method_used = "AI Scanner (Limit)"
 
             else:
+                # Standard Ghostscript Compression (Text-Safe)
                 print("🔧 Applying Standard Text-Safe Compression...", flush=True)
-                cmd = [
-                    'gs', '-sDEVICE=pdfwrite', '-dPDFSETTINGS=/ebook', 
-                    '-dNOPAUSE', '-dQUIET', '-dBATCH', 
-                    f'-sOutputFile={output_path}', input_path
-                ]
-                subprocess.run(cmd, check=True, timeout=30, capture_output=True)
-                method_used = "Smart Text-Safe"
-                target_hit = f'Normal ({os.path.getsize(output_path)/1024:.1f}KB)'
+                min_dpi, max_dpi = 20, 150
+                attempts = 0
+                
+                while attempts < 3:
+                    attempts += 1
+                    mid_dpi = (min_dpi + max_dpi) // 2
+                    mid_quality = max(10, min(80, int((mid_dpi / 150) * 70) + 10))
+                    attempt_path = os.path.join(temp_dir, f'attempt_{attempts}.pdf')
+                    
+                    cmd = [
+                        'gs', '-sDEVICE=pdfwrite', '-dCompatibilityLevel=1.4', 
+                        '-dPDFSETTINGS=/screen', '-dNOPAUSE', '-dQUIET', '-dBATCH', 
+                        '-dDownsampleColorImages=true', f'-dColorImageResolution={mid_dpi}', 
+                        '-dDownsampleGrayImages=true', f'-dGrayImageResolution={mid_dpi}', 
+                        f'-dJPEGQ={mid_quality}', '-dAutoRotatePages=/None'
+                    ]
+                    if grayscale:
+                        cmd.extend(['-sColorConversionStrategy=Gray', '-dProcessColorModel=/DeviceGray'])
+                    cmd.extend([f'-sOutputFile={attempt_path}', input_path])
+                    
+                    subprocess.run(cmd, check=True, timeout=15, capture_output=True)
+                    
+                    if os.path.exists(attempt_path):
+                        out_size = os.path.getsize(attempt_path)
+                        print(f'  [Standard Mode] DPI:{mid_dpi} -> {out_size/1024:.1f}KB', flush=True)
+                        
+                        if out_size <= target_size:
+                            shutil.copy(attempt_path, output_path)
+                            target_hit = f'Exact Hit ({out_size/1024:.1f}KB)'
+                            method_used = "Smart Text-Safe"
+                            break
+                        else:
+                            max_dpi = mid_dpi - 5
+                            
+                if not os.path.exists(output_path) and os.path.exists(attempt_path):
+                    shutil.copy(attempt_path, output_path)
+                    target_hit = f'Closest ({os.path.getsize(output_path)/1024:.1f}KB)'
+                    method_used = "Smart Text-Safe (Limit)"
 
         else:
+            # Normal Compression (No target specified)
             cmd = ['gs', '-sDEVICE=pdfwrite', '-dPDFSETTINGS=/screen', '-dNOPAUSE', '-dQUIET', '-dBATCH', f'-sOutputFile={output_path}', input_path]
             subprocess.run(cmd, check=True, timeout=30, capture_output=True)
+            method_used = "Normal Compress"
+            target_hit = f"Done ({os.path.getsize(output_path)/1024:.1f}KB)"
 
         output_size = os.path.getsize(output_path)
         
@@ -304,9 +343,6 @@ def compress():
         response.headers['X-Final-Size'] = str(output_size)
         response.headers['Access-Control-Expose-Headers'] = 'X-Compression-Method, X-Target-Hit, X-Original-Size, X-Final-Size'
         return response
-        
-    except subprocess.TimeoutExpired:
-        return 'Timeout: File too complex', 500
     except Exception as e:
         import traceback
         traceback.print_exc()
@@ -1022,8 +1058,10 @@ def image_to_sketch():
         intensity = max(1, min(100, intensity))
 
         out_fmt = (request.form.get('format', 'png') or 'png').lower()
-        if out_fmt == 'jpeg': out_fmt = 'jpg'
-        if out_fmt not in ['png', 'jpg', 'webp']: out_fmt = 'png'
+        if out_fmt == 'jpeg':
+            out_fmt = 'jpg'
+        if out_fmt not in ['png', 'jpg', 'webp']:
+            out_fmt = 'png'
 
         input_path = os.path.join(temp_dir, 'input.img')
         file.save(input_path)
@@ -1037,10 +1075,12 @@ def image_to_sketch():
         except Exception as e:
             return f'Cannot read image: {e}', 400
 
-        if img is None: return 'Invalid or unsupported image file.', 400
+        if img is None:
+            return 'Invalid or unsupported image file.', 400
 
         h, w = img.shape[:2]
-        if h * w > 25_000_000: return 'Image too large (max 25 megapixels).', 400
+        if h * w > 25_000_000:
+            return 'Image too large (max 25 megapixels).', 400
 
         MAX_DIM = 1600
         if max(h, w) > MAX_DIM:
@@ -1057,6 +1097,7 @@ def image_to_sketch():
             blur = cv2.GaussianBlur(inv, (kernel, kernel), 0)
             sketch = cv2.divide(gray, cv2.bitwise_not(blur), scale=256.0)
             sketch = cv2.cvtColor(sketch, cv2.COLOR_GRAY2BGR)
+
         elif style == 'charcoal':
             gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
             inv = cv2.bitwise_not(gray)
@@ -1066,16 +1107,19 @@ def image_to_sketch():
             sketch = cv2.divide(gray, cv2.bitwise_not(blur), scale=256.0)
             sketch = cv2.convertScaleAbs(sketch, alpha=1.4, beta=-40)
             sketch = cv2.cvtColor(sketch, cv2.COLOR_GRAY2BGR)
+
         elif style == 'ink':
             gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
             block = 11
             C = max(2, min(15, int(20 - intensity * 0.15)))
             sketch = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY, block, C)
             sketch = cv2.cvtColor(sketch, cv2.COLOR_GRAY2BGR)
+
         elif style == 'colored':
             inv = cv2.bitwise_not(img)
             blur = cv2.GaussianBlur(inv, (kernel, kernel), 0)
             sketch = cv2.divide(img, cv2.bitwise_not(blur), scale=256.0)
+
         elif style == 'edge':
             gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
             low = max(10, 60 - intensity // 3)
@@ -1084,6 +1128,7 @@ def image_to_sketch():
             edges = cv2.dilate(edges, np.ones((2, 2), np.uint8), iterations=1)
             sketch = cv2.bitwise_not(edges)
             sketch = cv2.cvtColor(sketch, cv2.COLOR_GRAY2BGR)
+
         elif style == 'crosshatch':
             gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
             inv = cv2.bitwise_not(gray)
@@ -1099,6 +1144,7 @@ def image_to_sketch():
             sketch = cv2.min(s1, s2)
             sketch = cv2.convertScaleAbs(sketch, alpha=1.15, beta=-15)
             sketch = cv2.cvtColor(sketch, cv2.COLOR_GRAY2BGR)
+
         else:
             gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
             inv = cv2.bitwise_not(gray)
@@ -1124,9 +1170,15 @@ def image_to_sketch():
         else:
             cv2.imwrite(output_path, sketch)
 
-        if not os.path.exists(output_path): return 'Sketch creation failed', 500
+        if not os.path.exists(output_path):
+            return 'Sketch creation failed', 500
 
-        response = send_file(output_path, mimetype=mime, as_attachment=True, download_name=f'sketch-{style}{ext}')
+        response = send_file(
+            output_path,
+            mimetype=mime,
+            as_attachment=True,
+            download_name=f'sketch-{style}{ext}'
+        )
         response.headers['X-Sketch-Style'] = style
         response.headers['X-Sketch-Intensity'] = str(intensity)
         response.headers['X-Sketch-Format'] = out_fmt
