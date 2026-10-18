@@ -10,6 +10,14 @@ import zipfile
 import io
 import re
 import glob
+import base64
+import json
+import urllib.parse
+import urllib.request
+from PIL import Image, ImageOps
+from PyPDF2 import PdfReader, PdfWriter
+import fitz  # PyMuPDF
+from rembg import remove
 
 app = Flask(__name__)
 CORS(app)
@@ -28,6 +36,7 @@ def auto_cleanup_worker():
             time.sleep(60)
             now = time.time()
             cleaned = 0
+            # Clean normal temp folders
             for folder in glob.glob('/tmp/tmp*'):
                 try:
                     if os.path.getmtime(folder) < now - 120:
@@ -35,6 +44,15 @@ def auto_cleanup_worker():
                         cleaned += 1
                 except:
                     pass
+            # Clean visual pdf session folders
+            for folder in glob.glob('/tmp/pdf_session_*'):
+                try:
+                    if os.path.getmtime(folder) < now - 300:
+                        shutil.rmtree(folder, ignore_errors=True)
+                        cleaned += 1
+                except:
+                    pass
+                    
             if cleaned > 0:
                 print(f'🧹 Auto-cleanup: {cleaned} folders removed', flush=True)
         except Exception as e:
@@ -61,7 +79,7 @@ HTML = '''
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Bharat24Tools API v9.8</title>
+    <title>Bharat24Tools API v10.1</title>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <style>
         * { margin:0; padding:0; box-sizing:border-box; font-family:Arial,sans-serif; }
@@ -78,10 +96,12 @@ HTML = '''
 </head>
 <body>
     <div class="container">
-        <h1>⚡ Bharat24Tools API v9.8</h1>
-        <p class="status-badge">Server is running ✅ — 24 Tools Active</p>
-        <div class="section-title">📄 PDF Tools (13)</div>
-        <div class="endpoint"><code>POST /compress</code><span class="desc">Compress PDF ✅ Smart (4 attempts, 20s each)</span></div>
+        <h1>⚡ Bharat24Tools API v10.1</h1>
+        <p class="status-badge">Server is running ✅ — 27 Tools Active</p>
+        <div class="section-title">📄 PDF Tools (15)</div>
+        <div class="endpoint"><code>POST /compress</code><span class="desc">Compress PDF ✅ AI Extreme Mode</span></div>
+        <div class="endpoint"><code>POST /preview-pdf</code><span class="desc">Visual PDF Thumbnails ✅ AI Blank Detection</span></div>
+        <div class="endpoint"><code>POST /process-visual-pdf</code><span class="desc">Merge Reordered PDF Visuals</span></div>
         <div class="endpoint"><code>POST /pdf-to-jpg</code><span class="desc">PDF to Images</span></div>
         <div class="endpoint"><code>POST /jpg-to-pdf</code><span class="desc">Images to PDF</span></div>
         <div class="endpoint"><code>POST /pdf-to-word</code><span class="desc">PDF to Word</span></div>
@@ -94,18 +114,19 @@ HTML = '''
         <div class="endpoint"><code>POST /rotate-pdf</code><span class="desc">Rotate PDF</span></div>
         <div class="endpoint"><code>POST /protect-pdf</code><span class="desc">Protect PDF</span></div>
         <div class="endpoint"><code>POST /unlock-pdf</code><span class="desc">Unlock PDF</span></div>
-        <div class="section-title">🖼 Image Tools (11)</div>
+        <div class="section-title">🖼 Image Tools (12)</div>
+        <div class="endpoint"><code>POST /ai-background-magic</code><span class="desc">AI Background Magic ✅ NEW</span></div>
         <div class="endpoint"><code>POST /heic-to-jpg</code><span class="desc">HEIC to JPG</span></div>
         <div class="endpoint"><code>POST /webp-to-jpg</code><span class="desc">WebP to JPG</span></div>
         <div class="endpoint"><code>POST /image-upscaler</code><span class="desc">AI Image Upscaler</span></div>
         <div class="endpoint"><code>POST /ocr</code><span class="desc">OCR Multi-Language</span></div>
-        <div class="endpoint"><code>POST /image-to-sketch</code><span class="desc">Image to Sketch ✅ 6 Styles + Intensity</span></div>
+        <div class="endpoint"><code>POST /image-to-sketch</code><span class="desc">Image to Sketch ✅ 6 Styles</span></div>
         <div class="endpoint"><code>POST /gif-maker</code><span class="desc">GIF Maker</span></div>
-        <div class="endpoint"><code>POST /image-to-word</code><span class="desc">Image to Word ✅ AI + Fallback</span></div>
-        <div class="endpoint"><code>POST /image-to-excel</code><span class="desc">Image to Excel ✅ AI + Fallback</span></div>
+        <div class="endpoint"><code>POST /image-to-word</code><span class="desc">Image to Word ✅ AI</span></div>
+        <div class="endpoint"><code>POST /image-to-excel</code><span class="desc">Image to Excel ✅ AI</span></div>
         <div class="endpoint"><code>POST /pdf-watermark</code><span class="desc">PDF Watermark</span></div>
         <div class="endpoint"><code>POST /pdf-page-delete</code><span class="desc">PDF Page Delete</span></div>
-        <p class="footer">Version 9.8 — 24 Tools | Fast Smart Compression + Advanced Sketch</p>
+        <p class="footer">Version 10.1 — 27 Tools | Visual PDF & AI Background Magic</p>
     </div>
 </body>
 </html>
@@ -177,19 +198,11 @@ def health():
     return {
         'status': 'ok',
         'service': 'bharat24tools-api',
-        'version': '9.8',
-        'tools': 24,
-        'ocr_engine': 'gemini-3.8-flash (with fallback)',
-        'sdk': 'google-genai',
-        'gemini_configured': bool(os.environ.get('GEMINI_API_KEY', '').strip()),
-        'max_files_ocr': 3,
-        'compression_range': '100KB - 2GB',
-        'fallback_models': ['gemini-3.8-flash', 'gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-1.5-flash'],
+        'version': '10.1',
+        'tools': 27,
         'auto_cleanup': True,
-        'compress_attempts': 4,
-        'attempt_timeout': ATTEMPT_TIMEOUT,
-        'sketch_styles': ['pencil', 'charcoal', 'ink', 'colored', 'edge', 'crosshatch'],
-        'sketch_formats': ['png', 'jpg', 'webp']
+        'visual_pdf': True,
+        'ai_background_magic': True
     }
 
 # ========== 1. COMPRESS PDF ==========
@@ -210,122 +223,87 @@ def compress():
         file.save(input_path)
         input_size = os.path.getsize(input_path)
 
-        preset = request.form.get('preset', 'recommended')
         target_bytes = request.form.get('target_bytes', '').strip()
-        dpi = request.form.get('dpi', '')
-        quality = request.form.get('quality', '')
         grayscale = request.form.get('grayscale', 'no') == 'yes'
-        font_subset = request.form.get('font_subset', 'yes') == 'yes'
-        compress_fonts = request.form.get('compress_fonts', 'yes') == 'yes'
-
+        
         try:
             target_size = int(target_bytes) if target_bytes else 0
         except:
             target_size = 0
 
-        MIN_TARGET = 100 * 1024
+        MIN_TARGET = 10 * 1024 
         if target_size > 0 and target_size < MIN_TARGET:
-            print(f'⚠️ Target {target_size/1024:.1f}KB too small. Setting to minimum 100KB.', flush=True)
             target_size = MIN_TARGET
 
-        PRESETS = {
-            'extreme': {'dpi': 50, 'quality': 30, 'pdf_settings': '/screen'},
-            'recommended': {'dpi': 72, 'quality': 70, 'pdf_settings': '/ebook'},
-            'high': {'dpi': 150, 'quality': 85, 'pdf_settings': '/printer'},
-        }
-
-        if preset in PRESETS:
-            config = PRESETS[preset]
-            use_dpi = config['dpi']
-            use_quality = config['quality']
-            use_pdf_settings = config['pdf_settings']
-        else:
-            use_dpi = int(dpi) if dpi else 72
-            use_quality = int(quality) if quality else 70
-            if use_dpi <= 72:
-                use_pdf_settings = '/screen'
-            elif use_dpi <= 150:
-                use_pdf_settings = '/ebook'
-            else:
-                use_pdf_settings = '/printer'
-
-        jpeg_q = max(10, min(100, use_quality))
-
-        def build_gs_cmd(inp, outp, dpi_val, jpeg_quality, pdf_settings, gray=False):
-            cmd = ['gs', '-sDEVICE=pdfwrite', '-dCompatibilityLevel=1.4', f'-dPDFSETTINGS={pdf_settings}', '-dNOPAUSE', '-dQUIET', '-dBATCH', '-dDetectDuplicateImages=true', '-dDownsampleColorImages=true', f'-dColorImageResolution={dpi_val}', '-dDownsampleGrayImages=true', f'-dGrayImageResolution={dpi_val}', '-dDownsampleMonoImages=true', f'-dMonoImageResolution={dpi_val}', f'-dJPEGQ={jpeg_quality}', '-dAutoRotatePages=/None']
-            if compress_fonts:
-                cmd.append('-dCompressFonts=true')
-            if font_subset:
-                cmd.append('-dSubsetFonts=true')
-            if gray or grayscale:
-                cmd.append('-sColorConversionStrategy=Gray')
-                cmd.append('-dProcessColorModel=/DeviceGray')
-            cmd.append(f'-sOutputFile={outp}')
-            cmd.append(inp)
-            return cmd
-
-        method_used = preset
-        target_hit = ''
-        best_output = None
-        best_size = input_size
         output_path = os.path.join(temp_dir, 'output.pdf')
+        method_used = "Standard AI"
+        target_hit = ""
 
         if target_size > 0 and target_size < input_size:
-            print(f'🎯 Target: {target_size/1024:.1f}KB (original: {input_size/1024:.1f}KB)', flush=True)
+            print(f'🎯 Target: {target_size/1024:.1f}KB (Original: {input_size/1024:.1f}KB)', flush=True)
+            
+            if target_size < (input_size * 0.25):
+                print("⚡ Extreme size detected. Activating AI Scanner Mode...", flush=True)
+                
+                min_dpi, max_dpi = 10, 60
+                attempts = 0
+                
+                while attempts < 4:
+                    attempts += 1
+                    current_dpi = (min_dpi + max_dpi) // 2
+                    
+                    jpg_pattern = f'{temp_dir}/page-%03d.jpg'
+                    for f in glob.glob(jpg_pattern): os.remove(f)
+                        
+                    subprocess.run([
+                        'gs', '-dNOPAUSE', '-dBATCH', '-dQUIET', '-sDEVICE=jpeg', 
+                        f'-r{current_dpi}', '-dJPEGQ=40', 
+                        f'-sOutputFile={jpg_pattern}', input_path
+                    ], check=True, timeout=15, capture_output=True)
+                    
+                    jpg_files = sorted(glob.glob(jpg_pattern))
+                    if not jpg_files: break
+                    
+                    raster_path = os.path.join(temp_dir, f'raster_{attempts}.pdf')
+                    subprocess.run([
+                        'gs', '-sDEVICE=pdfwrite', '-dCompatibilityLevel=1.4', 
+                        '-dNOPAUSE', '-dQUIET', '-dBATCH', 
+                        f'-sOutputFile={raster_path}'
+                    ] + jpg_files, check=True, timeout=15, capture_output=True)
+                    
+                    out_size = os.path.getsize(raster_path)
+                    print(f'  [Scanner Mode {attempts}] DPI:{current_dpi} -> {out_size/1024:.1f}KB', flush=True)
+                    
+                    if out_size <= target_size:
+                        shutil.copy(raster_path, output_path)
+                        target_hit = f'Exact Hit ({out_size/1024:.1f}KB)'
+                        method_used = "AI Extreme Scanner"
+                        break
+                    else:
+                        max_dpi = current_dpi - 2 
+                        
+                if not os.path.exists(output_path) and jpg_files:
+                    shutil.copy(raster_path, output_path)
+                    target_hit = f'Closest ({os.path.getsize(output_path)/1024:.1f}KB)'
+                    method_used = "AI Scanner (Limit)"
 
-            attempts = [
-                (72, 50, '/ebook',  'moderate'),
-                (50, 30, '/screen', 'aggressive'),
-                (30, 15, '/screen', 'very-aggressive'),
-                (20, 10, '/screen', 'extreme'),
-            ]
-
-            for i, (a_dpi, a_q, a_settings, a_label) in enumerate(attempts):
-                if best_size <= target_size:
-                    break
-                attempt_path = os.path.join(temp_dir, f'attempt-{i}.pdf')
-                try:
-                    cmd = build_gs_cmd(input_path, attempt_path, a_dpi, a_q, a_settings)
-                    subprocess.run(cmd, check=True, timeout=ATTEMPT_TIMEOUT, capture_output=True)
-                    if os.path.exists(attempt_path):
-                        out_size = os.path.getsize(attempt_path)
-                        print(f'  [{i+1}/4] {a_label} (dpi={a_dpi}, q={a_q}): {out_size/1024:.1f}KB', flush=True)
-                        if out_size < best_size:
-                            best_output = attempt_path
-                            best_size = out_size
-                            method_used = a_label
-                        if out_size <= target_size:
-                            target_hit = f'{out_size/1024:.1f}KB'
-                            print(f'  ✅ Target hit with {a_label}!', flush=True)
-                            break
-                except subprocess.TimeoutExpired:
-                    print(f'  ⏱️ {a_label} timed out after {ATTEMPT_TIMEOUT}s. Next...', flush=True)
-                    continue
-                except Exception as e:
-                    print(f'  ⚠️ {a_label} failed: {e}', flush=True)
-                    continue
-
-            if best_output and os.path.exists(best_output):
-                shutil.copy(best_output, output_path)
-                if target_hit == '':
-                    target_hit = f'best-effort ({best_size/1024:.1f}KB)'
-                    print(f'  ⚠️ Target not fully hit. Minimum possible: {best_size/1024:.1f}KB', flush=True)
             else:
-                return 'Compression failed', 500
+                print("🔧 Applying Standard Text-Safe Compression...", flush=True)
+                cmd = [
+                    'gs', '-sDEVICE=pdfwrite', '-dPDFSETTINGS=/ebook', 
+                    '-dNOPAUSE', '-dQUIET', '-dBATCH', 
+                    f'-sOutputFile={output_path}', input_path
+                ]
+                subprocess.run(cmd, check=True, timeout=30, capture_output=True)
+                method_used = "Smart Text-Safe"
+                target_hit = f'Normal ({os.path.getsize(output_path)/1024:.1f}KB)'
 
         else:
-            output_path = os.path.join(temp_dir, 'output.pdf')
-            cmd = build_gs_cmd(input_path, output_path, use_dpi, jpeg_q, use_pdf_settings)
-            print(f'🔧 Compression: preset={preset}, dpi={use_dpi}, quality={jpeg_q}, gray={grayscale}', flush=True)
-            subprocess.run(cmd, check=True, timeout=PROCESSING_TIMEOUT, capture_output=True)
-            if not os.path.exists(output_path):
-                return 'Compression failed', 500
+            cmd = ['gs', '-sDEVICE=pdfwrite', '-dPDFSETTINGS=/screen', '-dNOPAUSE', '-dQUIET', '-dBATCH', f'-sOutputFile={output_path}', input_path]
+            subprocess.run(cmd, check=True, timeout=30, capture_output=True)
 
         output_size = os.path.getsize(output_path)
-        saved = ((input_size - output_size) / input_size * 100) if input_size > 0 else 0
-
-        print(f'✅ Final: {input_size/1024:.1f}KB → {output_size/1024:.1f}KB ({saved:.1f}% saved) | method={method_used} | target={target_hit}', flush=True)
-
+        
         response = send_file(output_path, mimetype='application/pdf', as_attachment=True, download_name='compressed.pdf')
         response.headers['X-Compression-Method'] = method_used
         response.headers['X-Target-Hit'] = target_hit
@@ -333,18 +311,209 @@ def compress():
         response.headers['X-Final-Size'] = str(output_size)
         response.headers['Access-Control-Expose-Headers'] = 'X-Compression-Method, X-Target-Hit, X-Original-Size, X-Final-Size'
         return response
+        
     except subprocess.TimeoutExpired:
         return 'Timeout: File too complex', 500
     except Exception as e:
         import traceback
         traceback.print_exc()
-        print(f'❌ Compress error: {e}', flush=True)
         return f'Error: {str(e)}', 500
     finally:
         processing_lock.release()
         cleanup_dir(temp_dir)
 
-# ========== 2. PDF TO JPG ==========
+# ========== 2. PREVIEW PDF (Visual Editor Thumbnails) ==========
+@app.route('/preview-pdf', methods=['POST'])
+def preview_pdf():
+    if not processing_lock.acquire(timeout=300):
+        return {'error': 'Server busy. Try again.'}, 503
+    temp_dir = tempfile.mkdtemp()
+    try:
+        if 'files' not in request.files:
+            return {'error': 'No files uploaded'}, 400
+        
+        files = request.files.getlist('files')
+        all_pages = []
+        total_blank_pages = 0 
+
+        for file_idx, file in enumerate(files):
+            valid, msg = validate_file(file, allowed_ext=['.pdf'])
+            if not valid:
+                return {'error': f'File {file_idx+1}: {msg}'}, 400
+                
+            input_path = os.path.join(temp_dir, f'input_{file_idx}.pdf')
+            file.save(input_path)
+            
+            doc = fitz.open(input_path)
+            
+            for page_num in range(len(doc)):
+                page = doc.load_page(page_num)
+                text = page.get_text().strip()
+                is_blank = False
+                
+                if len(text) == 0:
+                    if len(page.get_images()) == 0:
+                        is_blank = True
+                        total_blank_pages += 1
+                
+                matrix = fitz.Matrix(0.5, 0.5)
+                pix = page.get_pixmap(matrix=matrix, alpha=False)
+                img_data = pix.tobytes("jpeg")
+                img_base64 = base64.b64encode(img_data).decode('utf-8')
+                
+                all_pages.append({
+                    'id': f'p_{file_idx}_{page_num}',
+                    'file_idx': file_idx,
+                    'page_num': page_num,
+                    'thumb': f'data:image/jpeg;base64,{img_base64}',
+                    'is_blank': is_blank
+                })
+            doc.close()
+            
+        session_id = str(int(time.time()))
+        session_dir = os.path.join('/tmp', f'pdf_session_{session_id}')
+        os.makedirs(session_dir, exist_ok=True)
+        
+        for file_idx in range(len(files)):
+            shutil.copy(os.path.join(temp_dir, f'input_{file_idx}.pdf'), session_dir)
+            
+        return {
+            'success': True,
+            'session_id': session_id,
+            'total_pages': len(all_pages),
+            'blank_pages_detected': total_blank_pages,
+            'pages': all_pages
+        }, 200
+        
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return {'error': str(e)}, 500
+    finally:
+        processing_lock.release()
+        cleanup_dir(temp_dir)
+
+# ========== 3. PROCESS VISUAL PDF (Drag & Drop Output) ==========
+@app.route('/process-visual-pdf', methods=['POST'])
+def process_visual_pdf():
+    if not processing_lock.acquire(timeout=300):
+        return 'Server busy. Try again.', 503
+    try:
+        data = request.json
+        session_id = data.get('session_id')
+        final_pages = data.get('pages', [])
+        
+        if not session_id or not final_pages:
+            return 'Invalid request', 400
+            
+        session_dir = os.path.join('/tmp', f'pdf_session_{session_id}')
+        if not os.path.exists(session_dir):
+            return 'Session expired. Please re-upload.', 400
+
+        writer = PdfWriter()
+        
+        for p in final_pages:
+            f_idx = p['file_idx']
+            pg_num = p['page_num']
+            
+            file_path = os.path.join(session_dir, f'input_{f_idx}.pdf')
+            if os.path.exists(file_path):
+                reader = PdfReader(file_path)
+                if pg_num < len(reader.pages):
+                    writer.add_page(reader.pages[pg_num])
+                    
+        output_path = os.path.join(session_dir, 'final_output.pdf')
+        with open(output_path, 'wb') as f:
+            writer.write(f)
+            
+        response = send_file(output_path, mimetype='application/pdf', as_attachment=True, download_name='Bharat24Tools_Visual.pdf')
+        
+        def cleanup_session():
+            time.sleep(60)
+            shutil.rmtree(session_dir, ignore_errors=True)
+        threading.Thread(target=cleanup_session, daemon=True).start()
+        
+        return response
+        
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return str(e), 500
+    finally:
+        processing_lock.release()
+
+# ========== 4. AI BACKGROUND MAGIC (Advanced Level) ==========
+@app.route('/ai-background-magic', methods=['POST'])
+def ai_background_magic():
+    if not processing_lock.acquire(timeout=300):
+        return 'Server busy. Try again.', 503
+    temp_dir = tempfile.mkdtemp()
+    try:
+        if 'file' not in request.files:
+            return 'No file uploaded', 400
+        
+        file = request.files['file']
+        prompt = request.form.get('prompt', '').strip()
+        
+        valid, msg = validate_file(file, allowed_ext=['.jpg', '.jpeg', '.png', '.webp'])
+        if not valid:
+            return msg, 400
+
+        input_path = os.path.join(temp_dir, 'input.jpg')
+        file.save(input_path)
+
+        img = Image.open(input_path)
+        img = ImageOps.exif_transpose(img)
+        if max(img.size) > 1500:
+            img.thumbnail((1500, 1500))
+        
+        resized_path = os.path.join(temp_dir, 'resized.jpg')
+        img.convert('RGB').save(resized_path, 'JPEG', quality=95)
+
+        print("🤖 Removing background...", flush=True)
+        with open(resized_path, 'rb') as i:
+            input_data = i.read()
+        
+        output_data = remove(input_data)
+        fg_path = os.path.join(temp_dir, 'foreground.png')
+        with open(fg_path, 'wb') as o:
+            o.write(output_data)
+        
+        foreground = Image.open(fg_path).convert("RGBA")
+
+        if prompt:
+            print(f"🎨 Generating AI background for: {prompt}", flush=True)
+            try:
+                encoded_prompt = urllib.parse.quote(prompt + ", high quality, realistic, 8k, cinematic lighting")
+                bg_url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?width=1024&height=1024&nologo=true"
+                
+                bg_path = os.path.join(temp_dir, 'bg.jpg')
+                urllib.request.urlretrieve(bg_url, bg_path)
+                
+                background = Image.open(bg_path).convert("RGBA")
+                background = background.resize(foreground.size, Image.LANCZOS)
+
+                final_img = Image.alpha_composite(background, foreground)
+                final_path = os.path.join(temp_dir, 'final_ai.jpg')
+                final_img.convert('RGB').save(final_path, 'JPEG', quality=95)
+                
+                return send_file(final_path, mimetype='image/jpeg', as_attachment=True, download_name='AI_Background.jpg')
+            
+            except Exception as e:
+                print(f"⚠️ Background generation failed: {e}", flush=True)
+                pass
+        
+        return send_file(fg_path, mimetype='image/png', as_attachment=True, download_name='Removed_BG.png')
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return f'Error: {str(e)}', 500
+    finally:
+        processing_lock.release()
+        cleanup_dir(temp_dir)
+
+# ========== 5. PDF TO JPG ==========
 @app.route('/pdf-to-jpg', methods=['POST'])
 def pdf_to_jpg():
     if not processing_lock.acquire(timeout=300):
@@ -381,7 +550,7 @@ def pdf_to_jpg():
         processing_lock.release()
         cleanup_dir(temp_dir)
 
-# ========== 3. JPG TO PDF ==========
+# ========== 6. JPG TO PDF ==========
 @app.route('/jpg-to-pdf', methods=['POST'])
 def jpg_to_pdf():
     if not processing_lock.acquire(timeout=300):
@@ -428,7 +597,7 @@ def jpg_to_pdf():
         processing_lock.release()
         cleanup_dir(temp_dir)
 
-# ========== 4. PDF TO WORD ==========
+# ========== 7. PDF TO WORD ==========
 @app.route('/pdf-to-word', methods=['POST'])
 def pdf_to_word():
     if not processing_lock.acquire(timeout=300):
@@ -473,7 +642,7 @@ def pdf_to_word():
         processing_lock.release()
         cleanup_dir(temp_dir)
 
-# ========== 5. WORD TO PDF ==========
+# ========== 8. WORD TO PDF ==========
 @app.route('/word-to-pdf', methods=['POST'])
 def word_to_pdf():
     if not processing_lock.acquire(timeout=300):
@@ -521,7 +690,7 @@ def word_to_pdf():
         processing_lock.release()
         cleanup_dir(temp_dir)
 
-# ========== 6. EXCEL TO PDF ==========
+# ========== 9. EXCEL TO PDF ==========
 @app.route('/excel-to-pdf', methods=['POST'])
 def excel_to_pdf():
     if not processing_lock.acquire(timeout=300):
@@ -645,7 +814,7 @@ def excel_to_pdf():
         processing_lock.release()
         cleanup_dir(temp_dir)
 
-# ========== 7. PDF TO EXCEL ==========
+# ========== 10. PDF TO EXCEL ==========
 @app.route('/pdf-to-excel', methods=['POST'])
 def pdf_to_excel():
     if not processing_lock.acquire(timeout=300):
@@ -689,7 +858,7 @@ def pdf_to_excel():
         processing_lock.release()
         cleanup_dir(temp_dir)
 
-# ========== 8. EXCEL TO IMAGE ==========
+# ========== 11. EXCEL TO IMAGE ==========
 @app.route('/excel-to-image', methods=['POST'])
 def excel_to_image():
     if not processing_lock.acquire(timeout=300):
@@ -736,7 +905,7 @@ def excel_to_image():
         processing_lock.release()
         cleanup_dir(temp_dir)
 
-# ========== 9. MERGE PDF ==========
+# ========== 12. MERGE PDF ==========
 @app.route('/merge-pdf', methods=['POST'])
 def merge_pdf():
     if not processing_lock.acquire(timeout=300):
@@ -766,7 +935,7 @@ def merge_pdf():
         processing_lock.release()
         cleanup_dir(temp_dir)
 
-# ========== 10. SPLIT PDF ==========
+# ========== 13. SPLIT PDF ==========
 @app.route('/split-pdf', methods=['POST'])
 def split_pdf():
     if not processing_lock.acquire(timeout=300):
@@ -804,7 +973,7 @@ def split_pdf():
         processing_lock.release()
         cleanup_dir(temp_dir)
 
-# ========== 11. ROTATE PDF ==========
+# ========== 14. ROTATE PDF ==========
 @app.route('/rotate-pdf', methods=['POST'])
 def rotate_pdf():
     if not processing_lock.acquire(timeout=300):
@@ -840,7 +1009,7 @@ def rotate_pdf():
         processing_lock.release()
         cleanup_dir(temp_dir)
 
-# ========== 12. PROTECT PDF ==========
+# ========== 15. PROTECT PDF ==========
 @app.route('/protect-pdf', methods=['POST'])
 def protect_pdf():
     if not processing_lock.acquire(timeout=300):
@@ -868,7 +1037,7 @@ def protect_pdf():
         processing_lock.release()
         cleanup_dir(temp_dir)
 
-# ========== 13. UNLOCK PDF ==========
+# ========== 16. UNLOCK PDF ==========
 @app.route('/unlock-pdf', methods=['POST'])
 def unlock_pdf():
     if not processing_lock.acquire(timeout=300):
@@ -895,7 +1064,7 @@ def unlock_pdf():
         processing_lock.release()
         cleanup_dir(temp_dir)
 
-# ========== 14. HEIC TO JPG ==========
+# ========== 17. HEIC TO JPG ==========
 @app.route('/heic-to-jpg', methods=['POST'])
 def heic_to_jpg():
     if not processing_lock.acquire(timeout=300):
@@ -924,7 +1093,7 @@ def heic_to_jpg():
         processing_lock.release()
         cleanup_dir(temp_dir)
 
-# ========== 15. WEBP TO JPG ==========
+# ========== 18. WEBP TO JPG ==========
 @app.route('/webp-to-jpg', methods=['POST'])
 def webp_to_jpg():
     if not processing_lock.acquire(timeout=300):
@@ -956,7 +1125,7 @@ def webp_to_jpg():
         processing_lock.release()
         cleanup_dir(temp_dir)
 
-# ========== 16. IMAGE UPSCALER ==========
+# ========== 19. IMAGE UPSCALER ==========
 @app.route('/image-upscaler', methods=['POST'])
 def image_upscaler():
     if not processing_lock.acquire(timeout=300):
@@ -986,7 +1155,7 @@ def image_upscaler():
         processing_lock.release()
         cleanup_dir(temp_dir)
 
-# ========== 17. OCR MULTILINGUAL ==========
+# ========== 20. OCR MULTILINGUAL ==========
 @app.route('/ocr', methods=['POST'])
 def ocr():
     if not processing_lock.acquire(timeout=300):
@@ -1016,12 +1185,12 @@ def ocr():
         processing_lock.release()
         cleanup_dir(temp_dir)
 
-# ========== 18. AVIF TO JPG ==========
+# ========== 21. AVIF TO JPG ==========
 @app.route('/avif-to-jpg', methods=['POST'])
 def avif_to_jpg():
     return 'Please use client-side version', 400
 
-# ========== 19. IMAGE TO SKETCH (UPGRADED: 6 styles + intensity + formats) ==========
+# ========== 22. IMAGE TO SKETCH ==========
 @app.route('/image-to-sketch', methods=['POST'])
 def image_to_sketch():
     if not processing_lock.acquire(timeout=300):
@@ -1039,7 +1208,6 @@ def image_to_sketch():
         if not valid:
             return msg, 400
 
-        # ---- Params ----
         style = (request.form.get('style', 'pencil') or 'pencil').lower()
         valid_styles = ['pencil', 'charcoal', 'ink', 'colored', 'edge', 'crosshatch']
         if style not in valid_styles:
@@ -1052,10 +1220,8 @@ def image_to_sketch():
         intensity = max(1, min(100, intensity))
 
         out_fmt = (request.form.get('format', 'png') or 'png').lower()
-        if out_fmt == 'jpeg':
-            out_fmt = 'jpg'
-        if out_fmt not in ['png', 'jpg', 'webp']:
-            out_fmt = 'png'
+        if out_fmt == 'jpeg': out_fmt = 'jpg'
+        if out_fmt not in ['png', 'jpg', 'webp']: out_fmt = 'png'
 
         input_path = os.path.join(temp_dir, 'input.img')
         file.save(input_path)
@@ -1063,43 +1229,32 @@ def image_to_sketch():
         import cv2
         import numpy as np
 
-        # Read image safely (handles unicode)
         try:
             buf = np.fromfile(input_path, dtype=np.uint8)
             img = cv2.imdecode(buf, cv2.IMREAD_COLOR)
         except Exception as e:
             return f'Cannot read image: {e}', 400
 
-        if img is None:
-            return 'Invalid or unsupported image file.', 400
+        if img is None: return 'Invalid or unsupported image file.', 400
 
         h, w = img.shape[:2]
+        if h * w > 25_000_000: return 'Image too large (max 25 megapixels).', 400
 
-        # Memory safety
-        if h * w > 25_000_000:
-            return 'Image too large (max 25 megapixels).', 400
-
-        # Auto-resize for speed
         MAX_DIM = 1600
         if max(h, w) > MAX_DIM:
             scale = MAX_DIM / max(h, w)
             img = cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
-            print(f'📐 Resized to {img.shape[1]}x{img.shape[0]}', flush=True)
 
-        # Intensity → kernel (1=sharp/high detail → 41; 100=soft/low detail → 3)
         kernel = int(41 - (intensity * 0.36))
         if kernel < 3: kernel = 3
         if kernel % 2 == 0: kernel += 1
-        print(f'🎨 style={style} intensity={intensity} kernel={kernel} fmt={out_fmt}', flush=True)
 
-        # ---- Style processing ----
         if style == 'pencil':
             gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
             inv = cv2.bitwise_not(gray)
             blur = cv2.GaussianBlur(inv, (kernel, kernel), 0)
             sketch = cv2.divide(gray, cv2.bitwise_not(blur), scale=256.0)
             sketch = cv2.cvtColor(sketch, cv2.COLOR_GRAY2BGR)
-
         elif style == 'charcoal':
             gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
             inv = cv2.bitwise_not(gray)
@@ -1109,19 +1264,16 @@ def image_to_sketch():
             sketch = cv2.divide(gray, cv2.bitwise_not(blur), scale=256.0)
             sketch = cv2.convertScaleAbs(sketch, alpha=1.4, beta=-40)
             sketch = cv2.cvtColor(sketch, cv2.COLOR_GRAY2BGR)
-
         elif style == 'ink':
             gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
             block = 11
             C = max(2, min(15, int(20 - intensity * 0.15)))
             sketch = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY, block, C)
             sketch = cv2.cvtColor(sketch, cv2.COLOR_GRAY2BGR)
-
         elif style == 'colored':
             inv = cv2.bitwise_not(img)
             blur = cv2.GaussianBlur(inv, (kernel, kernel), 0)
             sketch = cv2.divide(img, cv2.bitwise_not(blur), scale=256.0)
-
         elif style == 'edge':
             gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
             low = max(10, 60 - intensity // 3)
@@ -1130,16 +1282,13 @@ def image_to_sketch():
             edges = cv2.dilate(edges, np.ones((2, 2), np.uint8), iterations=1)
             sketch = cv2.bitwise_not(edges)
             sketch = cv2.cvtColor(sketch, cv2.COLOR_GRAY2BGR)
-
         elif style == 'crosshatch':
             gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
             inv = cv2.bitwise_not(gray)
             k = kernel if kernel >= 5 else 5
-            # Horizontal blur
             kern_h = cv2.getGaussianKernel(k, 0).T
             kern_h = np.repeat(kern_h, k, axis=0)
             blur_h = cv2.filter2D(inv, -1, kern_h)
-            # Vertical blur
             kern_v = cv2.getGaussianKernel(k, 0)
             kern_v = np.repeat(kern_v, k, axis=1)
             blur_v = cv2.filter2D(inv, -1, kern_v)
@@ -1148,22 +1297,18 @@ def image_to_sketch():
             sketch = cv2.min(s1, s2)
             sketch = cv2.convertScaleAbs(sketch, alpha=1.15, beta=-15)
             sketch = cv2.cvtColor(sketch, cv2.COLOR_GRAY2BGR)
-
         else:
-            # fallback pencil
             gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
             inv = cv2.bitwise_not(gray)
             blur = cv2.GaussianBlur(inv, (kernel, kernel), 0)
             sketch = cv2.divide(gray, cv2.bitwise_not(blur), scale=256.0)
             sketch = cv2.cvtColor(sketch, cv2.COLOR_GRAY2BGR)
 
-        # ---- Contrast + sharpen (except binary styles) ----
         if style not in ['edge', 'ink']:
             sketch = cv2.convertScaleAbs(sketch, alpha=1.08, beta=-4)
             gaussian = cv2.GaussianBlur(sketch, (0, 0), 1.4)
             sketch = cv2.addWeighted(sketch, 1.3, gaussian, -0.3, 0)
 
-        # ---- Save ----
         ext_map = {'png': '.png', 'jpg': '.jpg', 'webp': '.webp'}
         mime_map = {'png': 'image/png', 'jpg': 'image/jpeg', 'webp': 'image/webp'}
         ext = ext_map[out_fmt]
@@ -1177,18 +1322,9 @@ def image_to_sketch():
         else:
             cv2.imwrite(output_path, sketch)
 
-        if not os.path.exists(output_path):
-            return 'Sketch creation failed', 500
+        if not os.path.exists(output_path): return 'Sketch creation failed', 500
 
-        out_size = os.path.getsize(output_path)
-        print(f'✅ Sketch ready: {style} / intensity={intensity} / {out_fmt} / {out_size/1024:.1f}KB', flush=True)
-
-        response = send_file(
-            output_path,
-            mimetype=mime,
-            as_attachment=True,
-            download_name=f'sketch-{style}{ext}'
-        )
+        response = send_file(output_path, mimetype=mime, as_attachment=True, download_name=f'sketch-{style}{ext}')
         response.headers['X-Sketch-Style'] = style
         response.headers['X-Sketch-Intensity'] = str(intensity)
         response.headers['X-Sketch-Format'] = out_fmt
@@ -1197,13 +1333,12 @@ def image_to_sketch():
     except Exception as e:
         import traceback
         traceback.print_exc()
-        print(f'❌ Sketch error: {e}', flush=True)
         return f'Error: {str(e)}', 500
     finally:
         processing_lock.release()
         cleanup_dir(temp_dir)
 
-# ========== 20. GIF MAKER ==========
+# ========== 23. GIF MAKER ==========
 @app.route('/gif-maker', methods=['POST'])
 def gif_maker():
     if not processing_lock.acquire(timeout=300):
@@ -1237,7 +1372,7 @@ def gif_maker():
         processing_lock.release()
         cleanup_dir(temp_dir)
 
-# ========== 21. IMAGE TO WORD ==========
+# ========== 24. IMAGE TO WORD ==========
 @app.route('/image-to-word', methods=['POST'])
 def image_to_word():
     if not processing_lock.acquire(timeout=300):
@@ -1385,7 +1520,7 @@ Rules:
         processing_lock.release()
         cleanup_dir(temp_dir)
 
-# ========== 22. IMAGE TO EXCEL ==========
+# ========== 25. IMAGE TO EXCEL ==========
 @app.route('/image-to-excel', methods=['POST'])
 def image_to_excel():
     if not processing_lock.acquire(timeout=300):
@@ -1509,7 +1644,7 @@ Rules:
         processing_lock.release()
         cleanup_dir(temp_dir)
 
-# ========== 23. PDF WATERMARK ==========
+# ========== 26. PDF WATERMARK ==========
 @app.route('/pdf-watermark', methods=['POST'])
 def pdf_watermark():
     if not processing_lock.acquire(timeout=300):
@@ -1555,7 +1690,7 @@ def pdf_watermark():
         processing_lock.release()
         cleanup_dir(temp_dir)
 
-# ========== 24. PDF PAGE DELETE ==========
+# ========== 27. PDF PAGE DELETE ==========
 @app.route('/pdf-page-delete', methods=['POST'])
 def pdf_page_delete():
     if not processing_lock.acquire(timeout=300):
