@@ -239,6 +239,7 @@ def compress():
                 min_dpi, max_dpi = 10, 50
                 attempts = 0
                 jpg_files = []
+                raster_path = None # Initialize to avoid UnboundLocalError
                 
                 while attempts < 4: # Max 4 attempts for speed
                     attempts += 1
@@ -279,8 +280,8 @@ def compress():
                     else:
                         max_dpi = current_dpi - 2 
                         
-                # Fallback agar loop fail ho jaye
-                if not os.path.exists(output_path) and jpg_files:
+                # Fallback agar loop fail ho jaye (Target hit na ho)
+                if not os.path.exists(output_path) and raster_path and os.path.exists(raster_path):
                     shutil.copy(raster_path, output_path)
                     target_hit = f'Closest ({os.path.getsize(output_path)/1024:.1f}KB)'
                     method_used = "AI Scanner (Limit)"
@@ -290,6 +291,7 @@ def compress():
                 print("🔧 Applying Standard Text-Safe Compression...", flush=True)
                 min_dpi, max_dpi = 20, 150
                 attempts = 0
+                attempt_path = None
                 
                 while attempts < 3:
                     attempts += 1
@@ -322,7 +324,7 @@ def compress():
                         else:
                             max_dpi = mid_dpi - 5
                             
-                if not os.path.exists(output_path) and os.path.exists(attempt_path):
+                if not os.path.exists(output_path) and attempt_path and os.path.exists(attempt_path):
                     shutil.copy(attempt_path, output_path)
                     target_hit = f'Closest ({os.path.getsize(output_path)/1024:.1f}KB)'
                     method_used = "Smart Text-Safe (Limit)"
@@ -333,6 +335,21 @@ def compress():
             subprocess.run(cmd, check=True, timeout=30, capture_output=True)
             method_used = "Normal Compress"
             target_hit = f"Done ({os.path.getsize(output_path)/1024:.1f}KB)"
+
+        # ==================================================
+        # ULTIMATE FALLBACK (Safety Net)
+        # ==================================================
+        # Agar upar ke kisi bhi step me file nahi bani, toh standard compress karke do
+        if not os.path.exists(output_path):
+            print("🚨 Ultimate Fallback Activated: Output file missing. Applying standard compression.", flush=True)
+            cmd = ['gs', '-sDEVICE=pdfwrite', '-dPDFSETTINGS=/screen', '-dNOPAUSE', '-dQUIET', '-dBATCH', f'-sOutputFile={output_path}', input_path]
+            subprocess.run(cmd, check=True, timeout=30, capture_output=True)
+            method_used = "Fallback Standard"
+            target_hit = "Best Effort"
+
+        # Final check (Agar ab bhi file nahi bani toh error throw karo cleanly)
+        if not os.path.exists(output_path):
+            return 'Compression failed: Could not generate output file.', 500
 
         output_size = os.path.getsize(output_path)
         
