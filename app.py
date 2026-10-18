@@ -14,6 +14,7 @@ import base64
 import json
 from PIL import Image, ImageOps
 from PyPDF2 import PdfReader, PdfWriter
+import fitz  # PyMuPDF
 
 app = Flask(__name__)
 CORS(app)
@@ -68,7 +69,7 @@ HTML = '''
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Bharat24Tools API v10.3</title>
+    <title>Bharat24Tools API v10.4</title>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <style>
         * { margin:0; padding:0; box-sizing:border-box; font-family:Arial,sans-serif; }
@@ -85,10 +86,10 @@ HTML = '''
 </head>
 <body>
     <div class="container">
-        <h1>⚡ Bharat24Tools API v10.3</h1>
+        <h1>⚡ Bharat24Tools API v10.4</h1>
         <p class="status-badge">Server is running ✅ — Fast & Stable</p>
         <div class="section-title">📄 PDF Tools</div>
-        <div class="endpoint"><code>POST /compress</code><span class="desc">Compress PDF ✅ AI Extreme Mode</span></div>
+        <div class="endpoint"><code>POST /compress</code><span class="desc">Compress PDF ✅ Fixed</span></div>
         <div class="endpoint"><code>POST /preview-pdf</code><span class="desc">Visual PDF Thumbnails</span></div>
         <div class="endpoint"><code>POST /process-visual-pdf</code><span class="desc">Merge Reordered PDF Visuals</span></div>
         <div class="endpoint"><code>POST /pdf-to-jpg</code><span class="desc">PDF to Images</span></div>
@@ -114,7 +115,7 @@ HTML = '''
         <div class="endpoint"><code>POST /image-to-excel</code><span class="desc">Image to Excel ✅ AI</span></div>
         <div class="endpoint"><code>POST /pdf-watermark</code><span class="desc">PDF Watermark</span></div>
         <div class="endpoint"><code>POST /pdf-page-delete</code><span class="desc">PDF Page Delete</span></div>
-        <p class="footer">Version 10.3 — Stable & Optimized</p>
+        <p class="footer">Version 10.4 — Stable & Optimized</p>
     </div>
 </body>
 </html>
@@ -166,7 +167,7 @@ def index():
 
 @app.route('/health')
 def health():
-    return {'status': 'ok', 'version': '10.3'}
+    return {'status': 'ok', 'version': '10.4'}
 
 # ========== 1. COMPRESS PDF ==========
 @app.route('/compress', methods=['POST'])
@@ -206,7 +207,9 @@ def compress():
                     attempts += 1
                     current_dpi = (min_dpi + max_dpi) // 2
                     jpg_pattern = f'{temp_dir}/page-%03d.jpg'
-                    for f in glob.glob(jpg_pattern): os.remove(f)
+                    for f in glob.glob(jpg_pattern): 
+                        try: os.remove(f)
+                        except: pass
                         
                     subprocess.run(['gs', '-dNOPAUSE', '-dBATCH', '-dQUIET', '-sDEVICE=jpeg', f'-r{current_dpi}', '-dJPEGQ=40', f'-sOutputFile={jpg_pattern}', input_path], check=True, timeout=15, capture_output=True)
                     jpg_files = sorted(glob.glob(jpg_pattern))
@@ -215,15 +218,17 @@ def compress():
                     raster_path = os.path.join(temp_dir, f'raster_{attempts}.pdf')
                     subprocess.run(['gs', '-sDEVICE=pdfwrite', '-dCompatibilityLevel=1.4', '-dNOPAUSE', '-dQUIET', '-dBATCH', f'-sOutputFile={raster_path}'] + jpg_files, check=True, timeout=15, capture_output=True)
                     
-                    out_size = os.path.getsize(raster_path)
-                    if out_size <= target_size:
-                        shutil.copy(raster_path, output_path)
-                        target_hit = f'Exact Hit ({out_size/1024:.1f}KB)'
-                        method_used = "AI Extreme Scanner"
-                        break
-                    else: max_dpi = current_dpi - 2 
+                    if os.path.exists(raster_path):
+                        out_size = os.path.getsize(raster_path)
+                        if out_size <= target_size:
+                            shutil.copy(raster_path, output_path)
+                            target_hit = f'Exact Hit ({out_size/1024:.1f}KB)'
+                            method_used = "AI Extreme Scanner"
+                            break
+                        else: 
+                            max_dpi = current_dpi - 2 
                         
-                if not os.path.exists(output_path) and jpg_files:
+                if not os.path.exists(output_path) and jpg_files and os.path.exists(raster_path):
                     shutil.copy(raster_path, output_path)
                     target_hit = f'Closest ({os.path.getsize(output_path)/1024:.1f}KB)'
                     method_used = "AI Scanner (Limit)"
@@ -231,10 +236,16 @@ def compress():
                 cmd = ['gs', '-sDEVICE=pdfwrite', '-dPDFSETTINGS=/ebook', '-dNOPAUSE', '-dQUIET', '-dBATCH', f'-sOutputFile={output_path}', input_path]
                 subprocess.run(cmd, check=True, timeout=30, capture_output=True)
                 method_used = "Smart Text-Safe"
-                target_hit = f'Normal ({os.path.getsize(output_path)/1024:.1f}KB)'
+                if os.path.exists(output_path):
+                    target_hit = f'Normal ({os.path.getsize(output_path)/1024:.1f}KB)'
         else:
             cmd = ['gs', '-sDEVICE=pdfwrite', '-dPDFSETTINGS=/screen', '-dNOPAUSE', '-dQUIET', '-dBATCH', f'-sOutputFile={output_path}', input_path]
             subprocess.run(cmd, check=True, timeout=30, capture_output=True)
+
+        # ✅ FIX: Final check - Agar file nahi bani toh error do
+        if not os.path.exists(output_path):
+            print(f'❌ File not created at: {output_path}', flush=True)
+            return 'Compression failed: Output file was not created.', 500
 
         output_size = os.path.getsize(output_path)
         response = send_file(output_path, mimetype='application/pdf', as_attachment=True, download_name='compressed.pdf')
@@ -245,6 +256,8 @@ def compress():
         response.headers['Access-Control-Expose-Headers'] = 'X-Compression-Method, X-Target-Hit, X-Original-Size, X-Final-Size'
         return response
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         return f'Error: {str(e)}', 500
     finally:
         processing_lock.release()
@@ -261,8 +274,6 @@ def preview_pdf():
         files = request.files.getlist('files')
         all_pages = []
         total_blank_pages = 0 
-
-        import fitz 
 
         for file_idx, file in enumerate(files):
             valid, msg = validate_file(file, allowed_ext=['.pdf'])
