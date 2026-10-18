@@ -12,19 +12,15 @@ import re
 import glob
 import base64
 import json
-import urllib.parse
-import urllib.request
 from PIL import Image, ImageOps
 from PyPDF2 import PdfReader, PdfWriter
-import fitz  # PyMuPDF
-from rembg import remove
 
 app = Flask(__name__)
 CORS(app)
 
 MAX_FILE_SIZE = 20 * 1024 * 1024
 MAX_FILES_COUNT = 20
-PROCESSING_TIMEOUT = 120
+PROCESSING_TIMEOUT = 180
 CLEANUP_DELAY = 30
 ATTEMPT_TIMEOUT = 20
 
@@ -36,23 +32,18 @@ def auto_cleanup_worker():
             time.sleep(60)
             now = time.time()
             cleaned = 0
-            # Clean normal temp folders
             for folder in glob.glob('/tmp/tmp*'):
                 try:
                     if os.path.getmtime(folder) < now - 120:
                         shutil.rmtree(folder, ignore_errors=True)
                         cleaned += 1
-                except:
-                    pass
-            # Clean visual pdf session folders
+                except: pass
             for folder in glob.glob('/tmp/pdf_session_*'):
                 try:
                     if os.path.getmtime(folder) < now - 300:
                         shutil.rmtree(folder, ignore_errors=True)
                         cleaned += 1
-                except:
-                    pass
-                    
+                except: pass
             if cleaned > 0:
                 print(f'🧹 Auto-cleanup: {cleaned} folders removed', flush=True)
         except Exception as e:
@@ -69,17 +60,15 @@ def fast_cleanup():
             try:
                 if os.path.getmtime(folder) < now - 60:
                     shutil.rmtree(folder, ignore_errors=True)
-            except:
-                pass
-    except:
-        pass
+            except: pass
+    except: pass
 
 HTML = '''
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Bharat24Tools API v10.1</title>
+    <title>Bharat24Tools API v10.3</title>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <style>
         * { margin:0; padding:0; box-sizing:border-box; font-family:Arial,sans-serif; }
@@ -96,11 +85,11 @@ HTML = '''
 </head>
 <body>
     <div class="container">
-        <h1>⚡ Bharat24Tools API v10.1</h1>
-        <p class="status-badge">Server is running ✅ — 27 Tools Active</p>
-        <div class="section-title">📄 PDF Tools (15)</div>
+        <h1>⚡ Bharat24Tools API v10.3</h1>
+        <p class="status-badge">Server is running ✅ — Fast & Stable</p>
+        <div class="section-title">📄 PDF Tools</div>
         <div class="endpoint"><code>POST /compress</code><span class="desc">Compress PDF ✅ AI Extreme Mode</span></div>
-        <div class="endpoint"><code>POST /preview-pdf</code><span class="desc">Visual PDF Thumbnails ✅ AI Blank Detection</span></div>
+        <div class="endpoint"><code>POST /preview-pdf</code><span class="desc">Visual PDF Thumbnails</span></div>
         <div class="endpoint"><code>POST /process-visual-pdf</code><span class="desc">Merge Reordered PDF Visuals</span></div>
         <div class="endpoint"><code>POST /pdf-to-jpg</code><span class="desc">PDF to Images</span></div>
         <div class="endpoint"><code>POST /jpg-to-pdf</code><span class="desc">Images to PDF</span></div>
@@ -114,8 +103,7 @@ HTML = '''
         <div class="endpoint"><code>POST /rotate-pdf</code><span class="desc">Rotate PDF</span></div>
         <div class="endpoint"><code>POST /protect-pdf</code><span class="desc">Protect PDF</span></div>
         <div class="endpoint"><code>POST /unlock-pdf</code><span class="desc">Unlock PDF</span></div>
-        <div class="section-title">🖼 Image Tools (12)</div>
-        <div class="endpoint"><code>POST /ai-background-magic</code><span class="desc">AI Background Magic ✅ NEW</span></div>
+        <div class="section-title">🖼 Image Tools</div>
         <div class="endpoint"><code>POST /heic-to-jpg</code><span class="desc">HEIC to JPG</span></div>
         <div class="endpoint"><code>POST /webp-to-jpg</code><span class="desc">WebP to JPG</span></div>
         <div class="endpoint"><code>POST /image-upscaler</code><span class="desc">AI Image Upscaler</span></div>
@@ -126,7 +114,7 @@ HTML = '''
         <div class="endpoint"><code>POST /image-to-excel</code><span class="desc">Image to Excel ✅ AI</span></div>
         <div class="endpoint"><code>POST /pdf-watermark</code><span class="desc">PDF Watermark</span></div>
         <div class="endpoint"><code>POST /pdf-page-delete</code><span class="desc">PDF Page Delete</span></div>
-        <p class="footer">Version 10.1 — 27 Tools | Visual PDF & AI Background Magic</p>
+        <p class="footer">Version 10.3 — Stable & Optimized</p>
     </div>
 </body>
 </html>
@@ -135,25 +123,20 @@ HTML = '''
 def cleanup_dir(temp_dir, delay=CLEANUP_DELAY):
     def _cleanup():
         time.sleep(delay)
-        try:
-            shutil.rmtree(temp_dir, ignore_errors=True)
-        except:
-            pass
+        try: shutil.rmtree(temp_dir, ignore_errors=True)
+        except: pass
     threading.Thread(target=_cleanup, daemon=True).start()
 
 def validate_file(file, allowed_ext=None, max_size=MAX_FILE_SIZE):
-    if not file or file.filename == '':
-        return False, 'No file selected'
+    if not file or file.filename == '': return False, 'No file selected'
     if allowed_ext:
         if not any(file.filename.lower().endswith(ext) for ext in allowed_ext):
             return False, f'Only {", ".join(allowed_ext)} files allowed'
     file.seek(0, 2)
     size = file.tell()
     file.seek(0)
-    if size > max_size:
-        return False, f'File too large. Max {max_size/1024/1024:.1f}MB'
-    if size == 0:
-        return False, 'File is empty'
+    if size > max_size: return False, f'File too large. Max {max_size/1024/1024:.1f}MB'
+    if size == 0: return False, 'File is empty'
     return True, 'OK'
 
 def generate_gemini_response(client, prompt_text, img, filename=""):
@@ -164,29 +147,17 @@ def generate_gemini_response(client, prompt_text, img, filename=""):
     for model_name in models_to_try:
         for attempt in range(3):
             try:
-                print(f'🤖 Trying {model_name} (attempt {attempt+1}/3) for {filename}...', flush=True)
                 response = client.models.generate_content(model=model_name, contents=[prompt_text, img])
-                text = response.text.strip()
-                print(f'✅ Success with {model_name}', flush=True)
-                return text, model_name
+                return response.text.strip(), model_name
             except Exception as e:
                 error_str = str(e)
-                last_error = error_str
-                if '503' in error_str or 'UNAVAILABLE' in error_str or 'high demand' in error_str or 'overloaded' in error_str:
-                    wait_time = (2 ** attempt) + random.uniform(0, 1)
-                    print(f'⚠️ {model_name} overloaded. Waiting {wait_time:.1f}s...', flush=True)
-                    _time.sleep(wait_time)
+                if '503' in error_str or 'UNAVAILABLE' in error_str:
+                    _time.sleep((2 ** attempt) + random.uniform(0, 1))
                     continue
-                elif '404' in error_str or 'NOT_FOUND' in error_str or 'no longer available' in error_str:
-                    print(f'⚠️ {model_name} not available. Next model...', flush=True)
-                    break
-                elif '429' in error_str or 'quota' in error_str.lower() or 'RESOURCE_EXHAUSTED' in error_str:
-                    print(f'⚠️ {model_name} quota exceeded. Next model...', flush=True)
+                elif '404' in error_str or 'NOT_FOUND' in error_str or '429' in error_str or 'quota' in error_str.lower():
                     break
                 else:
-                    print(f'❌ {model_name} error: {error_str[:200]}', flush=True)
                     raise e
-        print(f'⚠️ {model_name} failed. Next model...', flush=True)
     raise Exception(f'All AI models are busy. Please try again in 1-2 minutes.')
 
 @app.route('/')
@@ -195,15 +166,7 @@ def index():
 
 @app.route('/health')
 def health():
-    return {
-        'status': 'ok',
-        'service': 'bharat24tools-api',
-        'version': '10.1',
-        'tools': 27,
-        'auto_cleanup': True,
-        'visual_pdf': True,
-        'ai_background_magic': True
-    }
+    return {'status': 'ok', 'version': '10.3'}
 
 # ========== 1. COMPRESS PDF ==========
 @app.route('/compress', methods=['POST'])
@@ -212,12 +175,10 @@ def compress():
         return 'Server busy. Try again.', 503
     temp_dir = tempfile.mkdtemp()
     try:
-        if 'file' not in request.files:
-            return 'No file uploaded', 400
+        if 'file' not in request.files: return 'No file uploaded', 400
         file = request.files['file']
         valid, msg = validate_file(file, allowed_ext=['.pdf'], max_size=20 * 1024 * 1024)
-        if not valid:
-            return msg, 400
+        if not valid: return msg, 400
 
         input_path = os.path.join(temp_dir, 'input.pdf')
         file.save(input_path)
@@ -226,14 +187,11 @@ def compress():
         target_bytes = request.form.get('target_bytes', '').strip()
         grayscale = request.form.get('grayscale', 'no') == 'yes'
         
-        try:
-            target_size = int(target_bytes) if target_bytes else 0
-        except:
-            target_size = 0
+        try: target_size = int(target_bytes) if target_bytes else 0
+        except: target_size = 0
 
         MIN_TARGET = 10 * 1024 
-        if target_size > 0 and target_size < MIN_TARGET:
-            target_size = MIN_TARGET
+        if target_size > 0 and target_size < MIN_TARGET: target_size = MIN_TARGET
 
         output_path = os.path.join(temp_dir, 'output.pdf')
         method_used = "Standard AI"
@@ -241,69 +199,44 @@ def compress():
 
         if target_size > 0 and target_size < input_size:
             print(f'🎯 Target: {target_size/1024:.1f}KB (Original: {input_size/1024:.1f}KB)', flush=True)
-            
             if target_size < (input_size * 0.25):
-                print("⚡ Extreme size detected. Activating AI Scanner Mode...", flush=True)
-                
                 min_dpi, max_dpi = 10, 60
                 attempts = 0
-                
                 while attempts < 4:
                     attempts += 1
                     current_dpi = (min_dpi + max_dpi) // 2
-                    
                     jpg_pattern = f'{temp_dir}/page-%03d.jpg'
                     for f in glob.glob(jpg_pattern): os.remove(f)
                         
-                    subprocess.run([
-                        'gs', '-dNOPAUSE', '-dBATCH', '-dQUIET', '-sDEVICE=jpeg', 
-                        f'-r{current_dpi}', '-dJPEGQ=40', 
-                        f'-sOutputFile={jpg_pattern}', input_path
-                    ], check=True, timeout=15, capture_output=True)
-                    
+                    subprocess.run(['gs', '-dNOPAUSE', '-dBATCH', '-dQUIET', '-sDEVICE=jpeg', f'-r{current_dpi}', '-dJPEGQ=40', f'-sOutputFile={jpg_pattern}', input_path], check=True, timeout=15, capture_output=True)
                     jpg_files = sorted(glob.glob(jpg_pattern))
                     if not jpg_files: break
                     
                     raster_path = os.path.join(temp_dir, f'raster_{attempts}.pdf')
-                    subprocess.run([
-                        'gs', '-sDEVICE=pdfwrite', '-dCompatibilityLevel=1.4', 
-                        '-dNOPAUSE', '-dQUIET', '-dBATCH', 
-                        f'-sOutputFile={raster_path}'
-                    ] + jpg_files, check=True, timeout=15, capture_output=True)
+                    subprocess.run(['gs', '-sDEVICE=pdfwrite', '-dCompatibilityLevel=1.4', '-dNOPAUSE', '-dQUIET', '-dBATCH', f'-sOutputFile={raster_path}'] + jpg_files, check=True, timeout=15, capture_output=True)
                     
                     out_size = os.path.getsize(raster_path)
-                    print(f'  [Scanner Mode {attempts}] DPI:{current_dpi} -> {out_size/1024:.1f}KB', flush=True)
-                    
                     if out_size <= target_size:
                         shutil.copy(raster_path, output_path)
                         target_hit = f'Exact Hit ({out_size/1024:.1f}KB)'
                         method_used = "AI Extreme Scanner"
                         break
-                    else:
-                        max_dpi = current_dpi - 2 
+                    else: max_dpi = current_dpi - 2 
                         
                 if not os.path.exists(output_path) and jpg_files:
                     shutil.copy(raster_path, output_path)
                     target_hit = f'Closest ({os.path.getsize(output_path)/1024:.1f}KB)'
                     method_used = "AI Scanner (Limit)"
-
             else:
-                print("🔧 Applying Standard Text-Safe Compression...", flush=True)
-                cmd = [
-                    'gs', '-sDEVICE=pdfwrite', '-dPDFSETTINGS=/ebook', 
-                    '-dNOPAUSE', '-dQUIET', '-dBATCH', 
-                    f'-sOutputFile={output_path}', input_path
-                ]
+                cmd = ['gs', '-sDEVICE=pdfwrite', '-dPDFSETTINGS=/ebook', '-dNOPAUSE', '-dQUIET', '-dBATCH', f'-sOutputFile={output_path}', input_path]
                 subprocess.run(cmd, check=True, timeout=30, capture_output=True)
                 method_used = "Smart Text-Safe"
                 target_hit = f'Normal ({os.path.getsize(output_path)/1024:.1f}KB)'
-
         else:
             cmd = ['gs', '-sDEVICE=pdfwrite', '-dPDFSETTINGS=/screen', '-dNOPAUSE', '-dQUIET', '-dBATCH', f'-sOutputFile={output_path}', input_path]
             subprocess.run(cmd, check=True, timeout=30, capture_output=True)
 
         output_size = os.path.getsize(output_path)
-        
         response = send_file(output_path, mimetype='application/pdf', as_attachment=True, download_name='compressed.pdf')
         response.headers['X-Compression-Method'] = method_used
         response.headers['X-Target-Hit'] = target_hit
@@ -311,55 +244,44 @@ def compress():
         response.headers['X-Final-Size'] = str(output_size)
         response.headers['Access-Control-Expose-Headers'] = 'X-Compression-Method, X-Target-Hit, X-Original-Size, X-Final-Size'
         return response
-        
-    except subprocess.TimeoutExpired:
-        return 'Timeout: File too complex', 500
     except Exception as e:
-        import traceback
-        traceback.print_exc()
         return f'Error: {str(e)}', 500
     finally:
         processing_lock.release()
         cleanup_dir(temp_dir)
 
-# ========== 2. PREVIEW PDF (Visual Editor Thumbnails) ==========
+# ========== 2. VISUAL PDF PREVIEW ==========
 @app.route('/preview-pdf', methods=['POST'])
 def preview_pdf():
     if not processing_lock.acquire(timeout=300):
         return {'error': 'Server busy. Try again.'}, 503
     temp_dir = tempfile.mkdtemp()
     try:
-        if 'files' not in request.files:
-            return {'error': 'No files uploaded'}, 400
-        
+        if 'files' not in request.files: return {'error': 'No files uploaded'}, 400
         files = request.files.getlist('files')
         all_pages = []
         total_blank_pages = 0 
 
+        import fitz 
+
         for file_idx, file in enumerate(files):
             valid, msg = validate_file(file, allowed_ext=['.pdf'])
-            if not valid:
-                return {'error': f'File {file_idx+1}: {msg}'}, 400
+            if not valid: return {'error': f'File {file_idx+1}: {msg}'}, 400
                 
             input_path = os.path.join(temp_dir, f'input_{file_idx}.pdf')
             file.save(input_path)
             
             doc = fitz.open(input_path)
-            
             for page_num in range(len(doc)):
                 page = doc.load_page(page_num)
                 text = page.get_text().strip()
                 is_blank = False
+                if len(text) == 0 and len(page.get_images()) == 0:
+                    is_blank = True
+                    total_blank_pages += 1
                 
-                if len(text) == 0:
-                    if len(page.get_images()) == 0:
-                        is_blank = True
-                        total_blank_pages += 1
-                
-                matrix = fitz.Matrix(0.5, 0.5)
-                pix = page.get_pixmap(matrix=matrix, alpha=False)
-                img_data = pix.tobytes("jpeg")
-                img_base64 = base64.b64encode(img_data).decode('utf-8')
+                pix = page.get_pixmap(matrix=fitz.Matrix(0.5, 0.5), alpha=False)
+                img_base64 = base64.b64encode(pix.tobytes("jpeg")).decode('utf-8')
                 
                 all_pages.append({
                     'id': f'p_{file_idx}_{page_num}',
@@ -373,27 +295,16 @@ def preview_pdf():
         session_id = str(int(time.time()))
         session_dir = os.path.join('/tmp', f'pdf_session_{session_id}')
         os.makedirs(session_dir, exist_ok=True)
-        
         for file_idx in range(len(files)):
             shutil.copy(os.path.join(temp_dir, f'input_{file_idx}.pdf'), session_dir)
             
-        return {
-            'success': True,
-            'session_id': session_id,
-            'total_pages': len(all_pages),
-            'blank_pages_detected': total_blank_pages,
-            'pages': all_pages
-        }, 200
-        
+        return {'success': True, 'session_id': session_id, 'total_pages': len(all_pages), 'blank_pages_detected': total_blank_pages, 'pages': all_pages}, 200
     except Exception as e:
-        import traceback
-        traceback.print_exc()
         return {'error': str(e)}, 500
     finally:
         processing_lock.release()
         cleanup_dir(temp_dir)
 
-# ========== 3. PROCESS VISUAL PDF (Drag & Drop Output) ==========
 @app.route('/process-visual-pdf', methods=['POST'])
 def process_visual_pdf():
     if not processing_lock.acquire(timeout=300):
@@ -403,19 +314,14 @@ def process_visual_pdf():
         session_id = data.get('session_id')
         final_pages = data.get('pages', [])
         
-        if not session_id or not final_pages:
-            return 'Invalid request', 400
-            
+        if not session_id or not final_pages: return 'Invalid request', 400
         session_dir = os.path.join('/tmp', f'pdf_session_{session_id}')
-        if not os.path.exists(session_dir):
-            return 'Session expired. Please re-upload.', 400
+        if not os.path.exists(session_dir): return 'Session expired. Please re-upload.', 400
 
         writer = PdfWriter()
-        
         for p in final_pages:
             f_idx = p['file_idx']
             pg_num = p['page_num']
-            
             file_path = os.path.join(session_dir, f'input_{f_idx}.pdf')
             if os.path.exists(file_path):
                 reader = PdfReader(file_path)
@@ -427,208 +333,107 @@ def process_visual_pdf():
             writer.write(f)
             
         response = send_file(output_path, mimetype='application/pdf', as_attachment=True, download_name='Bharat24Tools_Visual.pdf')
-        
         def cleanup_session():
             time.sleep(60)
             shutil.rmtree(session_dir, ignore_errors=True)
         threading.Thread(target=cleanup_session, daemon=True).start()
-        
         return response
-        
     except Exception as e:
-        import traceback
-        traceback.print_exc()
         return str(e), 500
     finally:
         processing_lock.release()
 
-# ========== 4. AI BACKGROUND MAGIC (Advanced Level) ==========
-@app.route('/ai-background-magic', methods=['POST'])
-def ai_background_magic():
-    if not processing_lock.acquire(timeout=300):
-        return 'Server busy. Try again.', 503
-    temp_dir = tempfile.mkdtemp()
-    try:
-        if 'file' not in request.files:
-            return 'No file uploaded', 400
-        
-        file = request.files['file']
-        prompt = request.form.get('prompt', '').strip()
-        
-        valid, msg = validate_file(file, allowed_ext=['.jpg', '.jpeg', '.png', '.webp'])
-        if not valid:
-            return msg, 400
-
-        input_path = os.path.join(temp_dir, 'input.jpg')
-        file.save(input_path)
-
-        img = Image.open(input_path)
-        img = ImageOps.exif_transpose(img)
-        if max(img.size) > 1500:
-            img.thumbnail((1500, 1500))
-        
-        resized_path = os.path.join(temp_dir, 'resized.jpg')
-        img.convert('RGB').save(resized_path, 'JPEG', quality=95)
-
-        print("🤖 Removing background...", flush=True)
-        with open(resized_path, 'rb') as i:
-            input_data = i.read()
-        
-        output_data = remove(input_data)
-        fg_path = os.path.join(temp_dir, 'foreground.png')
-        with open(fg_path, 'wb') as o:
-            o.write(output_data)
-        
-        foreground = Image.open(fg_path).convert("RGBA")
-
-        if prompt:
-            print(f"🎨 Generating AI background for: {prompt}", flush=True)
-            try:
-                encoded_prompt = urllib.parse.quote(prompt + ", high quality, realistic, 8k, cinematic lighting")
-                bg_url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?width=1024&height=1024&nologo=true"
-                
-                bg_path = os.path.join(temp_dir, 'bg.jpg')
-                urllib.request.urlretrieve(bg_url, bg_path)
-                
-                background = Image.open(bg_path).convert("RGBA")
-                background = background.resize(foreground.size, Image.LANCZOS)
-
-                final_img = Image.alpha_composite(background, foreground)
-                final_path = os.path.join(temp_dir, 'final_ai.jpg')
-                final_img.convert('RGB').save(final_path, 'JPEG', quality=95)
-                
-                return send_file(final_path, mimetype='image/jpeg', as_attachment=True, download_name='AI_Background.jpg')
-            
-            except Exception as e:
-                print(f"⚠️ Background generation failed: {e}", flush=True)
-                pass
-        
-        return send_file(fg_path, mimetype='image/png', as_attachment=True, download_name='Removed_BG.png')
-
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        return f'Error: {str(e)}', 500
-    finally:
-        processing_lock.release()
-        cleanup_dir(temp_dir)
-
-# ========== 5. PDF TO JPG ==========
+# ========== 3. PDF TO JPG ==========
 @app.route('/pdf-to-jpg', methods=['POST'])
 def pdf_to_jpg():
     if not processing_lock.acquire(timeout=300):
         return 'Server busy. Try again.', 503
     temp_dir = tempfile.mkdtemp()
     try:
-        if 'file' not in request.files:
-            return 'No file uploaded', 400
+        if 'file' not in request.files: return 'No file uploaded', 400
         file = request.files['file']
         valid, msg = validate_file(file, allowed_ext=['.pdf'])
-        if not valid:
-            return msg, 400
+        if not valid: return msg, 400
         input_path = os.path.join(temp_dir, 'input.pdf')
         file.save(input_path)
         output_pattern = os.path.join(temp_dir, 'page-%03d.jpg')
         subprocess.run(['gs', '-dNOPAUSE', '-dBATCH', '-dQUIET', '-sDEVICE=jpeg', '-r150', '-dJPEGQ=90', f'-sOutputFile={output_pattern}', input_path], check=True, timeout=PROCESSING_TIMEOUT, capture_output=True)
         jpg_files = sorted([f for f in os.listdir(temp_dir) if f.startswith('page-') and f.endswith('.jpg')])
-        if not jpg_files:
-            return 'No pages converted', 500
+        if not jpg_files: return 'No pages converted', 500
         if len(jpg_files) == 1:
             return send_file(os.path.join(temp_dir, jpg_files[0]), mimetype='image/jpeg', as_attachment=True, download_name='page-1.jpg')
         zip_buffer = io.BytesIO()
         with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
-            for jpg in jpg_files:
-                zf.write(os.path.join(temp_dir, jpg), jpg)
+            for jpg in jpg_files: zf.write(os.path.join(temp_dir, jpg), jpg)
         zip_buffer.seek(0)
         return send_file(zip_buffer, mimetype='application/zip', as_attachment=True, download_name='pdf-pages.zip')
-    except subprocess.TimeoutExpired:
-        return 'Timeout: PDF too large', 500
     except Exception as e:
-        print(f'❌ PDF to JPG error: {e}', flush=True)
         return f'Error: {str(e)}', 500
     finally:
         processing_lock.release()
         cleanup_dir(temp_dir)
 
-# ========== 6. JPG TO PDF ==========
+# ========== 4. JPG TO PDF ==========
 @app.route('/jpg-to-pdf', methods=['POST'])
 def jpg_to_pdf():
     if not processing_lock.acquire(timeout=300):
         return 'Server busy. Try again.', 503
     temp_dir = tempfile.mkdtemp()
     try:
-        if 'files' not in request.files:
-            return 'No files uploaded', 400
+        if 'files' not in request.files: return 'No files uploaded', 400
         files = request.files.getlist('files')
-        if len(files) > MAX_FILES_COUNT:
-            return f'Max {MAX_FILES_COUNT} files allowed', 400
-        if not files:
-            return 'No files selected', 400
-        from PIL import Image
+        if len(files) > MAX_FILES_COUNT: return f'Max {MAX_FILES_COUNT} files allowed', 400
+        if not files: return 'No files selected', 400
         images = []
         for i, file in enumerate(files):
             valid, msg = validate_file(file, allowed_ext=['.jpg', '.jpeg', '.png'])
-            if not valid:
-                return f'File {i+1}: {msg}', 400
+            if not valid: return f'File {i+1}: {msg}', 400
             path = os.path.join(temp_dir, f'img-{i:03d}{os.path.splitext(file.filename)[1].lower()}')
             file.save(path)
             img = Image.open(path)
             if img.mode in ('RGBA', 'LA', 'P'):
                 background = Image.new('RGB', img.size, (255, 255, 255))
-                if img.mode == 'RGBA':
-                    background.paste(img, mask=img.split()[-1])
-                else:
-                    background.paste(img)
+                if img.mode == 'RGBA': background.paste(img, mask=img.split()[-1])
+                else: background.paste(img)
                 img = background
-            elif img.mode != 'RGB':
-                img = img.convert('RGB')
+            elif img.mode != 'RGB': img = img.convert('RGB')
             images.append(img)
-        if not images:
-            return 'No valid images', 400
+        if not images: return 'No valid images', 400
         output_path = os.path.join(temp_dir, 'output.pdf')
         images[0].save(output_path, 'PDF', save_all=True, append_images=images[1:], resolution=100.0)
-        if not os.path.exists(output_path):
-            return 'PDF creation failed', 500
         return send_file(output_path, mimetype='application/pdf', as_attachment=True, download_name='images.pdf')
     except Exception as e:
-        print(f'❌ JPG to PDF error: {e}', flush=True)
         return f'Error: {str(e)}', 500
     finally:
         processing_lock.release()
         cleanup_dir(temp_dir)
 
-# ========== 7. PDF TO WORD ==========
+# ========== 5. PDF TO WORD ==========
 @app.route('/pdf-to-word', methods=['POST'])
 def pdf_to_word():
     if not processing_lock.acquire(timeout=300):
         return 'Server busy. Try again.', 503
     temp_dir = tempfile.mkdtemp()
     try:
-        if 'file' not in request.files:
-            return 'No file uploaded', 400
+        if 'file' not in request.files: return 'No file uploaded', 400
         file = request.files['file']
         valid, msg = validate_file(file, allowed_ext=['.pdf'])
-        if not valid:
-            return msg, 400
+        if not valid: return msg, 400
         input_path = os.path.join(temp_dir, 'input.pdf')
         output_path = os.path.join(temp_dir, 'output.docx')
         txt_path = os.path.join(temp_dir, 'extracted.txt')
         file.save(input_path)
         subprocess.run(['gs', '-sDEVICE=txtwrite', '-dNOPAUSE', '-dBATCH', '-dQUIET', f'-sOutputFile={txt_path}', input_path], check=True, timeout=PROCESSING_TIMEOUT, capture_output=True)
-        if not os.path.exists(txt_path):
-            return 'Text extraction failed', 500
-        with open(txt_path, 'r', encoding='utf-8', errors='ignore') as f:
-            text = f.read()
-        if not text.strip():
-            return 'No text found', 400
+        if not os.path.exists(txt_path): return 'Text extraction failed', 500
+        with open(txt_path, 'r', encoding='utf-8', errors='ignore') as f: text = f.read()
+        if not text.strip(): return 'No text found', 400
         from docx import Document
         from docx.shared import Pt, RGBColor
         doc = Document()
         heading = doc.add_heading('Converted from PDF', 0)
         heading.runs[0].font.color.rgb = RGBColor(0xa8, 0x55, 0xf7)
         for line in text.split('\n'):
-            if line.strip():
-                doc.add_paragraph(line)
+            if line.strip(): doc.add_paragraph(line)
         doc.add_paragraph('')
         foot = doc.add_paragraph('Created with Bharat24Tools')
         foot.runs[0].italic = True
@@ -636,25 +441,22 @@ def pdf_to_word():
         doc.save(output_path)
         return send_file(output_path, mimetype='application/vnd.openxmlformats-officedocument.wordprocessingml.document', as_attachment=True, download_name='converted.docx')
     except Exception as e:
-        print(f'❌ PDF to Word error: {e}', flush=True)
         return f'Error: {str(e)}', 500
     finally:
         processing_lock.release()
         cleanup_dir(temp_dir)
 
-# ========== 8. WORD TO PDF ==========
+# ========== 6. WORD TO PDF ==========
 @app.route('/word-to-pdf', methods=['POST'])
 def word_to_pdf():
     if not processing_lock.acquire(timeout=300):
         return 'Server busy. Try again.', 503
     temp_dir = tempfile.mkdtemp()
     try:
-        if 'file' not in request.files:
-            return 'No file uploaded', 400
+        if 'file' not in request.files: return 'No file uploaded', 400
         file = request.files['file']
         valid, msg = validate_file(file, allowed_ext=['.docx'])
-        if not valid:
-            return msg, 400
+        if not valid: return msg, 400
         input_path = os.path.join(temp_dir, 'input.docx')
         output_path = os.path.join(temp_dir, 'output.pdf')
         file.save(input_path)
@@ -676,33 +478,29 @@ def word_to_pdf():
                 story.append(Spacer(1, 6))
                 continue
             safe_text = text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
-            if para.style.name.startswith('Heading'):
-                story.append(Paragraph(safe_text, heading_style))
+            if para.style.name.startswith('Heading'): story.append(Paragraph(safe_text, heading_style))
             else:
                 story.append(Paragraph(safe_text, normal_style))
                 story.append(Spacer(1, 4))
         pdf.build(story)
         return send_file(output_path, mimetype='application/pdf', as_attachment=True, download_name='converted.pdf')
     except Exception as e:
-        print(f'❌ Word to PDF error: {e}', flush=True)
         return f'Error: {str(e)}', 500
     finally:
         processing_lock.release()
         cleanup_dir(temp_dir)
 
-# ========== 9. EXCEL TO PDF ==========
+# ========== 7. EXCEL TO PDF ==========
 @app.route('/excel-to-pdf', methods=['POST'])
 def excel_to_pdf():
     if not processing_lock.acquire(timeout=300):
         return 'Server busy. Try again.', 503
     temp_dir = tempfile.mkdtemp()
     try:
-        if 'file' not in request.files:
-            return 'No file uploaded', 400
+        if 'file' not in request.files: return 'No file uploaded', 400
         file = request.files['file']
         valid, msg = validate_file(file, allowed_ext=['.xlsx', '.xls'], max_size=15 * 1024 * 1024)
-        if not valid:
-            return msg, 400
+        if not valid: return msg, 400
         input_path = os.path.join(temp_dir, 'input.xlsx')
         output_path = os.path.join(temp_dir, 'output.pdf')
         file.save(input_path)
@@ -712,7 +510,6 @@ def excel_to_pdf():
         from reportlab.lib.units import mm
         from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, PageBreak
         from reportlab.lib import colors
-        from datetime import datetime
 
         def clean_cell(value):
             if value is None: return ''
@@ -745,13 +542,10 @@ def excel_to_pdf():
         def esc(text):
             return str(text).replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
 
-        try:
-            wb = load_workbook(input_path, data_only=True, read_only=True)
+        try: wb = load_workbook(input_path, data_only=True, read_only=True)
         except:
-            try:
-                wb = load_workbook(input_path, data_only=True, read_only=False)
-            except:
-                return 'Cannot read this Excel file.', 400
+            try: wb = load_workbook(input_path, data_only=True, read_only=False)
+            except: return 'Cannot read this Excel file.', 400
 
         pdf = SimpleDocTemplate(output_path, pagesize=landscape(A4), leftMargin=10*mm, rightMargin=10*mm, topMargin=25*mm, bottomMargin=18*mm)
         styles = getSampleStyleSheet()
@@ -764,8 +558,7 @@ def excel_to_pdf():
         MAX_COLS = 15
 
         for s_idx, s_name in enumerate(wb.sheetnames):
-            try:
-                sheet = wb[s_name]
+            try: sheet = wb[s_name]
             except: continue
             raw_data = []
             try:
@@ -775,10 +568,8 @@ def excel_to_pdf():
                     if any(cleaned): raw_data.append(cleaned)
             except: continue
             if not raw_data: continue
-            if total_sheets > 1:
-                story.append(Paragraph(f'📄 Sheet {s_idx + 1}: {esc(s_name)}', sheet_style))
-            else:
-                story.append(Paragraph(f'📄 Sheet: {esc(s_name)}', sheet_style))
+            if total_sheets > 1: story.append(Paragraph(f'📄 Sheet {s_idx + 1}: {esc(s_name)}', sheet_style))
+            else: story.append(Paragraph(f'📄 Sheet: {esc(s_name)}', sheet_style))
             display_data = []
             for row in raw_data:
                 d = [smart_truncate(c, 50) for c in row]
@@ -798,31 +589,26 @@ def excel_to_pdf():
             story.append(tbl)
             story.append(Spacer(1, 8))
             total_rows += len(display_data) - 1
-            if s_idx < total_sheets - 1:
-                story.append(PageBreak())
+            if s_idx < total_sheets - 1: story.append(PageBreak())
         try: wb.close()
         except: pass
-        if total_rows == 0:
-            return 'Excel file is empty', 400
+        if total_rows == 0: return 'Excel file is empty', 400
         pdf.build(story)
         return send_file(output_path, mimetype='application/pdf', as_attachment=True, download_name=f'Bharat24Tools_{file.filename.rsplit(".", 1)[0]}.pdf')
     except Exception as e:
-        import traceback
-        traceback.print_exc()
         return f'Error: {str(e)}', 500
     finally:
         processing_lock.release()
         cleanup_dir(temp_dir)
 
-# ========== 10. PDF TO EXCEL ==========
+# ========== 8. PDF TO EXCEL ==========
 @app.route('/pdf-to-excel', methods=['POST'])
 def pdf_to_excel():
     if not processing_lock.acquire(timeout=300):
         return 'Server busy. Try again.', 503
     temp_dir = tempfile.mkdtemp()
     try:
-        if 'file' not in request.files:
-            return 'No file uploaded', 400
+        if 'file' not in request.files: return 'No file uploaded', 400
         file = request.files['file']
         valid, msg = validate_file(file, allowed_ext=['.pdf'])
         if not valid: return msg, 400
@@ -852,21 +638,19 @@ def pdf_to_excel():
         wb.save(output_path)
         return send_file(output_path, mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', as_attachment=True, download_name='converted.xlsx')
     except Exception as e:
-        print(f'❌ PDF to Excel error: {e}', flush=True)
         return f'Error: {str(e)}', 500
     finally:
         processing_lock.release()
         cleanup_dir(temp_dir)
 
-# ========== 11. EXCEL TO IMAGE ==========
+# ========== 9. EXCEL TO IMAGE ==========
 @app.route('/excel-to-image', methods=['POST'])
 def excel_to_image():
     if not processing_lock.acquire(timeout=300):
         return 'Server busy. Try again.', 503
     temp_dir = tempfile.mkdtemp()
     try:
-        if 'file' not in request.files:
-            return 'No file uploaded', 400
+        if 'file' not in request.files: return 'No file uploaded', 400
         file = request.files['file']
         valid, msg = validate_file(file, allowed_ext=['.xlsx', '.xls'])
         if not valid: return msg, 400
@@ -899,21 +683,19 @@ def excel_to_image():
         plt.close()
         return send_file(output_path, mimetype='image/png', as_attachment=True, download_name='excel-image.png')
     except Exception as e:
-        print(f'❌ Excel to Image error: {e}', flush=True)
         return f'Error: {str(e)}', 500
     finally:
         processing_lock.release()
         cleanup_dir(temp_dir)
 
-# ========== 12. MERGE PDF ==========
+# ========== 10. MERGE PDF ==========
 @app.route('/merge-pdf', methods=['POST'])
 def merge_pdf():
     if not processing_lock.acquire(timeout=300):
         return 'Server busy. Try again.', 503
     temp_dir = tempfile.mkdtemp()
     try:
-        if 'files' not in request.files:
-            return 'No files uploaded', 400
+        if 'files' not in request.files: return 'No files uploaded', 400
         files = request.files.getlist('files')
         if len(files) < 2: return 'At least 2 PDFs required', 400
         if len(files) > MAX_FILES_COUNT: return f'Max {MAX_FILES_COUNT} files allowed', 400
@@ -926,24 +708,21 @@ def merge_pdf():
         output_path = os.path.join(temp_dir, 'merged.pdf')
         cmd = ['gs', '-sDEVICE=pdfwrite', '-dNOPAUSE', '-dBATCH', '-dQUIET', '-dCompatibilityLevel=1.4', f'-sOutputFile={output_path}'] + pdf_paths
         subprocess.run(cmd, check=True, timeout=PROCESSING_TIMEOUT, capture_output=True)
-        if not os.path.exists(output_path): return 'Merge failed', 500
         return send_file(output_path, mimetype='application/pdf', as_attachment=True, download_name='merged.pdf')
     except Exception as e:
-        print(f'❌ Merge error: {e}', flush=True)
         return f'Error: {str(e)}', 500
     finally:
         processing_lock.release()
         cleanup_dir(temp_dir)
 
-# ========== 13. SPLIT PDF ==========
+# ========== 11. SPLIT PDF ==========
 @app.route('/split-pdf', methods=['POST'])
 def split_pdf():
     if not processing_lock.acquire(timeout=300):
         return 'Server busy. Try again.', 503
     temp_dir = tempfile.mkdtemp()
     try:
-        if 'file' not in request.files:
-            return 'No file uploaded', 400
+        if 'file' not in request.files: return 'No file uploaded', 400
         file = request.files['file']
         valid, msg = validate_file(file, allowed_ext=['.pdf'])
         if not valid: return msg, 400
@@ -967,21 +746,19 @@ def split_pdf():
         zip_buffer.seek(0)
         return send_file(zip_buffer, mimetype='application/zip', as_attachment=True, download_name='split-pages.zip')
     except Exception as e:
-        print(f'❌ Split error: {e}', flush=True)
         return f'Error: {str(e)}', 500
     finally:
         processing_lock.release()
         cleanup_dir(temp_dir)
 
-# ========== 14. ROTATE PDF ==========
+# ========== 12. ROTATE PDF ==========
 @app.route('/rotate-pdf', methods=['POST'])
 def rotate_pdf():
     if not processing_lock.acquire(timeout=300):
         return 'Server busy. Try again.', 503
     temp_dir = tempfile.mkdtemp()
     try:
-        if 'file' not in request.files:
-            return 'No file uploaded', 400
+        if 'file' not in request.files: return 'No file uploaded', 400
         file = request.files['file']
         valid, msg = validate_file(file, allowed_ext=['.pdf'])
         if not valid: return msg, 400
@@ -1000,52 +777,45 @@ def rotate_pdf():
         if total_pages == 0: return 'Cannot read PDF page count', 400
         rotate_spec = f'+{angle}:1-{total_pages}'
         subprocess.run(['qpdf', f'--rotate={rotate_spec}', input_path, output_path], check=True, timeout=PROCESSING_TIMEOUT, capture_output=True)
-        if not os.path.exists(output_path): return 'Rotation failed', 500
         return send_file(output_path, mimetype='application/pdf', as_attachment=True, download_name='rotated.pdf')
     except Exception as e:
-        print(f'❌ Rotate error: {e}', flush=True)
         return f'Error: {str(e)}', 500
     finally:
         processing_lock.release()
         cleanup_dir(temp_dir)
 
-# ========== 15. PROTECT PDF ==========
+# ========== 13. PROTECT PDF ==========
 @app.route('/protect-pdf', methods=['POST'])
 def protect_pdf():
     if not processing_lock.acquire(timeout=300):
         return 'Server busy. Try again.', 503
     temp_dir = tempfile.mkdtemp()
     try:
-        if 'file' not in request.files:
-            return 'No file uploaded', 400
+        if 'file' not in request.files: return 'No file uploaded', 400
         file = request.files['file']
         valid, msg = validate_file(file, allowed_ext=['.pdf'])
         if not valid: return msg, 400
         password = request.form.get('password', '').strip()
-        if not password or len(password) < 4:
-            return 'Password must be at least 4 characters', 400
+        if not password or len(password) < 4: return 'Password must be at least 4 characters', 400
         input_path = os.path.join(temp_dir, 'input.pdf')
         output_path = os.path.join(temp_dir, 'protected.pdf')
         file.save(input_path)
         subprocess.run(['qpdf', '--encrypt', password, password, '256', '--', input_path, output_path], check=True, timeout=PROCESSING_TIMEOUT, capture_output=True)
-        if not os.path.exists(output_path): return 'Encryption failed', 500
         return send_file(output_path, mimetype='application/pdf', as_attachment=True, download_name='protected.pdf')
     except Exception as e:
-        print(f'❌ Protect error: {e}', flush=True)
         return f'Error: {str(e)}', 500
     finally:
         processing_lock.release()
         cleanup_dir(temp_dir)
 
-# ========== 16. UNLOCK PDF ==========
+# ========== 14. UNLOCK PDF ==========
 @app.route('/unlock-pdf', methods=['POST'])
 def unlock_pdf():
     if not processing_lock.acquire(timeout=300):
         return 'Server busy. Try again.', 503
     temp_dir = tempfile.mkdtemp()
     try:
-        if 'file' not in request.files:
-            return 'No file uploaded', 400
+        if 'file' not in request.files: return 'No file uploaded', 400
         file = request.files['file']
         valid, msg = validate_file(file, allowed_ext=['.pdf'])
         if not valid: return msg, 400
@@ -1055,24 +825,21 @@ def unlock_pdf():
         output_path = os.path.join(temp_dir, 'unlocked.pdf')
         file.save(input_path)
         subprocess.run(['qpdf', f'--password={password}', '--decrypt', input_path, output_path], check=True, timeout=PROCESSING_TIMEOUT, capture_output=True)
-        if not os.path.exists(output_path): return 'Unlock failed', 500
         return send_file(output_path, mimetype='application/pdf', as_attachment=True, download_name='unlocked.pdf')
     except Exception as e:
-        print(f'❌ Unlock error: {e}', flush=True)
         return f'Error: {str(e)}', 500
     finally:
         processing_lock.release()
         cleanup_dir(temp_dir)
 
-# ========== 17. HEIC TO JPG ==========
+# ========== 15. HEIC TO JPG ==========
 @app.route('/heic-to-jpg', methods=['POST'])
 def heic_to_jpg():
     if not processing_lock.acquire(timeout=300):
         return 'Server busy. Try again.', 503
     temp_dir = tempfile.mkdtemp()
     try:
-        if 'file' not in request.files:
-            return 'No file uploaded', 400
+        if 'file' not in request.files: return 'No file uploaded', 400
         file = request.files['file']
         valid, msg = validate_file(file, allowed_ext=['.heic', '.heif'])
         if not valid: return msg, 400
@@ -1080,60 +847,53 @@ def heic_to_jpg():
         output_path = os.path.join(temp_dir, 'output.jpg')
         file.save(input_path)
         from pillow_heif import register_heif_opener
-        from PIL import Image
         register_heif_opener()
         img = Image.open(input_path)
         if img.mode != 'RGB': img = img.convert('RGB')
         img.save(output_path, 'JPEG', quality=90)
         return send_file(output_path, mimetype='image/jpeg', as_attachment=True, download_name='converted.jpg')
     except Exception as e:
-        print(f'❌ HEIC error: {e}', flush=True)
         return f'Error: {str(e)}', 500
     finally:
         processing_lock.release()
         cleanup_dir(temp_dir)
 
-# ========== 18. WEBP TO JPG ==========
+# ========== 16. WEBP TO JPG ==========
 @app.route('/webp-to-jpg', methods=['POST'])
 def webp_to_jpg():
     if not processing_lock.acquire(timeout=300):
         return 'Server busy. Try again.', 503
     temp_dir = tempfile.mkdtemp()
     try:
-        if 'file' not in request.files:
-            return 'No file uploaded', 400
+        if 'file' not in request.files: return 'No file uploaded', 400
         file = request.files['file']
         valid, msg = validate_file(file, allowed_ext=['.webp'])
         if not valid: return msg, 400
         input_path = os.path.join(temp_dir, 'input.webp')
         output_path = os.path.join(temp_dir, 'output.jpg')
         file.save(input_path)
-        from PIL import Image
         img = Image.open(input_path)
         if img.mode in ('RGBA', 'LA', 'P'):
             bg = Image.new('RGB', img.size, (255, 255, 255))
             bg.paste(img, mask=img.split()[-1] if img.mode == 'RGBA' else None)
             img = bg
-        elif img.mode != 'RGB':
-            img = img.convert('RGB')
+        elif img.mode != 'RGB': img = img.convert('RGB')
         img.save(output_path, 'JPEG', quality=92)
         return send_file(output_path, mimetype='image/jpeg', as_attachment=True, download_name='converted.jpg')
     except Exception as e:
-        print(f'❌ WebP error: {e}', flush=True)
         return f'Error: {str(e)}', 500
     finally:
         processing_lock.release()
         cleanup_dir(temp_dir)
 
-# ========== 19. IMAGE UPSCALER ==========
+# ========== 17. IMAGE UPSCALER ==========
 @app.route('/image-upscaler', methods=['POST'])
 def image_upscaler():
     if not processing_lock.acquire(timeout=300):
         return 'Server busy. Try again.', 503
     temp_dir = tempfile.mkdtemp()
     try:
-        if 'file' not in request.files:
-            return 'No file uploaded', 400
+        if 'file' not in request.files: return 'No file uploaded', 400
         file = request.files['file']
         valid, msg = validate_file(file, allowed_ext=['.jpg', '.jpeg', '.png', '.webp'])
         if not valid: return msg, 400
@@ -1142,28 +902,25 @@ def image_upscaler():
         input_path = os.path.join(temp_dir, 'input.png')
         output_path = os.path.join(temp_dir, 'output.png')
         file.save(input_path)
-        from PIL import Image
         img = Image.open(input_path)
         new_size = (img.width * scale, img.height * scale)
         upscaled = img.resize(new_size, Image.LANCZOS)
         upscaled.save(output_path, 'PNG')
         return send_file(output_path, mimetype='image/png', as_attachment=True, download_name='upscaled.png')
     except Exception as e:
-        print(f'❌ Upscaler error: {e}', flush=True)
         return f'Error: {str(e)}', 500
     finally:
         processing_lock.release()
         cleanup_dir(temp_dir)
 
-# ========== 20. OCR MULTILINGUAL ==========
+# ========== 18. OCR MULTILINGUAL ==========
 @app.route('/ocr', methods=['POST'])
 def ocr():
     if not processing_lock.acquire(timeout=300):
         return 'Server busy. Try again.', 503
     temp_dir = tempfile.mkdtemp()
     try:
-        if 'file' not in request.files:
-            return 'No file uploaded', 400
+        if 'file' not in request.files: return 'No file uploaded', 400
         file = request.files['file']
         valid, msg = validate_file(file, allowed_ext=['.jpg', '.jpeg', '.png', '.webp'])
         if not valid: return msg, 400
@@ -1171,7 +928,6 @@ def ocr():
         input_path = os.path.join(temp_dir, 'input.png')
         file.save(input_path)
         import pytesseract
-        from PIL import Image
         pytesseract.pytesseract.tesseract_cmd = r'/usr/bin/tesseract'
         img = Image.open(input_path)
         text = pytesseract.image_to_string(img, lang=lang)
@@ -1179,44 +935,29 @@ def ocr():
         with open(output_path, 'w', encoding='utf-8') as f: f.write(text)
         return send_file(output_path, mimetype='text/plain', as_attachment=True, download_name='extracted.txt')
     except Exception as e:
-        print(f'❌ OCR error: {e}', flush=True)
         return f'Error: {str(e)}', 500
     finally:
         processing_lock.release()
         cleanup_dir(temp_dir)
 
-# ========== 21. AVIF TO JPG ==========
-@app.route('/avif-to-jpg', methods=['POST'])
-def avif_to_jpg():
-    return 'Please use client-side version', 400
-
-# ========== 22. IMAGE TO SKETCH ==========
+# ========== 19. IMAGE TO SKETCH ==========
 @app.route('/image-to-sketch', methods=['POST'])
 def image_to_sketch():
     if not processing_lock.acquire(timeout=300):
         return 'Server busy. Try again.', 503
     temp_dir = tempfile.mkdtemp()
     try:
-        if 'file' not in request.files:
-            return 'No file uploaded', 400
+        if 'file' not in request.files: return 'No file uploaded', 400
         file = request.files['file']
-        valid, msg = validate_file(
-            file,
-            allowed_ext=['.jpg', '.jpeg', '.png', '.webp', '.bmp', '.tiff', '.tif'],
-            max_size=15 * 1024 * 1024
-        )
-        if not valid:
-            return msg, 400
+        valid, msg = validate_file(file, allowed_ext=['.jpg', '.jpeg', '.png', '.webp', '.bmp', '.tiff', '.tif'], max_size=15 * 1024 * 1024)
+        if not valid: return msg, 400
 
         style = (request.form.get('style', 'pencil') or 'pencil').lower()
         valid_styles = ['pencil', 'charcoal', 'ink', 'colored', 'edge', 'crosshatch']
-        if style not in valid_styles:
-            style = 'pencil'
+        if style not in valid_styles: style = 'pencil'
 
-        try:
-            intensity = int(request.form.get('intensity', '50'))
-        except:
-            intensity = 50
+        try: intensity = int(request.form.get('intensity', '50'))
+        except: intensity = 50
         intensity = max(1, min(100, intensity))
 
         out_fmt = (request.form.get('format', 'png') or 'png').lower()
@@ -1232,8 +973,7 @@ def image_to_sketch():
         try:
             buf = np.fromfile(input_path, dtype=np.uint8)
             img = cv2.imdecode(buf, cv2.IMREAD_COLOR)
-        except Exception as e:
-            return f'Cannot read image: {e}', 400
+        except Exception as e: return f'Cannot read image: {e}', 400
 
         if img is None: return 'Invalid or unsupported image file.', 400
 
@@ -1315,14 +1055,9 @@ def image_to_sketch():
         mime = mime_map[out_fmt]
         output_path = os.path.join(temp_dir, f'sketch{ext}')
 
-        if out_fmt == 'jpg':
-            cv2.imwrite(output_path, sketch, [cv2.IMWRITE_JPEG_QUALITY, 92])
-        elif out_fmt == 'webp':
-            cv2.imwrite(output_path, sketch, [cv2.IMWRITE_WEBP_QUALITY, 90])
-        else:
-            cv2.imwrite(output_path, sketch)
-
-        if not os.path.exists(output_path): return 'Sketch creation failed', 500
+        if out_fmt == 'jpg': cv2.imwrite(output_path, sketch, [cv2.IMWRITE_JPEG_QUALITY, 92])
+        elif out_fmt == 'webp': cv2.imwrite(output_path, sketch, [cv2.IMWRITE_WEBP_QUALITY, 90])
+        else: cv2.imwrite(output_path, sketch)
 
         response = send_file(output_path, mimetype=mime, as_attachment=True, download_name=f'sketch-{style}{ext}')
         response.headers['X-Sketch-Style'] = style
@@ -1331,26 +1066,22 @@ def image_to_sketch():
         response.headers['Access-Control-Expose-Headers'] = 'X-Sketch-Style, X-Sketch-Intensity, X-Sketch-Format'
         return response
     except Exception as e:
-        import traceback
-        traceback.print_exc()
         return f'Error: {str(e)}', 500
     finally:
         processing_lock.release()
         cleanup_dir(temp_dir)
 
-# ========== 23. GIF MAKER ==========
+# ========== 20. GIF MAKER ==========
 @app.route('/gif-maker', methods=['POST'])
 def gif_maker():
     if not processing_lock.acquire(timeout=300):
         return 'Server busy. Try again.', 503
     temp_dir = tempfile.mkdtemp()
     try:
-        if 'files' not in request.files:
-            return 'No files uploaded', 400
+        if 'files' not in request.files: return 'No files uploaded', 400
         files = request.files.getlist('files')
         if len(files) < 2: return 'At least 2 images required', 400
         if len(files) > 20: return 'Max 20 images', 400
-        from PIL import Image
         images = []
         for i, file in enumerate(files):
             valid, msg = validate_file(file, allowed_ext=['.jpg', '.jpeg', '.png', '.webp'])
@@ -1366,32 +1097,26 @@ def gif_maker():
         images[0].save(output_path, 'GIF', save_all=True, append_images=images[1:], duration=duration, loop=0, optimize=True)
         return send_file(output_path, mimetype='image/gif', as_attachment=True, download_name='animation.gif')
     except Exception as e:
-        print(f'❌ GIF error: {e}', flush=True)
         return f'Error: {str(e)}', 500
     finally:
         processing_lock.release()
         cleanup_dir(temp_dir)
 
-# ========== 24. IMAGE TO WORD ==========
+# ========== 21. IMAGE TO WORD ==========
 @app.route('/image-to-word', methods=['POST'])
 def image_to_word():
     if not processing_lock.acquire(timeout=300):
         return 'Server busy. Try again.', 503
     temp_dir = tempfile.mkdtemp()
     try:
-        if 'files' in request.files:
-            files = request.files.getlist('files')
-        elif 'file' in request.files:
-            files = [request.files['file']]
-        else:
-            return 'No files uploaded', 400
+        if 'files' in request.files: files = request.files.getlist('files')
+        elif 'file' in request.files: files = [request.files['file']]
+        else: return 'No files uploaded', 400
         files = [f for f in files if f and f.filename]
         if not files: return 'No files uploaded', 400
         if len(files) > 3: return 'Max 3 files allowed per request', 400
         custom_title = request.form.get('title', 'Extracted Text')[:60]
         from google import genai
-        from PIL import Image
-        import json
         from docx import Document
         from docx.shared import Pt, RGBColor, Cm
         from docx.enum.text import WD_ALIGN_PARAGRAPH
@@ -1402,12 +1127,7 @@ def image_to_word():
         prompt_text = """Extract ALL text from this image, preserving structure.
 Return ONLY valid JSON, no explanation, no markdown:
 {"tables":[{"rows":[["cell1","cell2"],["cell3","cell4"]]}],"plain_text":"any text outside tables"}
-Rules:
-- Preserve EXACT text including Hindi/Devanagari
-- Each table row is an array of cell strings
-- If no table but structured data exists, treat as 1-column table
-- If only plain text, tables = [], plain_text = full text
-- Return ONLY JSON"""
+Rules: - Preserve EXACT text including Hindi/Devanagari - Each table row is an array of cell strings - If no table but structured data exists, treat as 1-column table - If only plain text, tables = [], plain_text = full text - Return ONLY JSON"""
         results = []
         for idx, file in enumerate(files):
             valid, msg = validate_file(file, allowed_ext=['.jpg', '.jpeg', '.png', '.webp', '.bmp', '.tiff', '.tif'], max_size=15 * 1024 * 1024)
@@ -1423,7 +1143,6 @@ Rules:
                     ratio = max_dim / max(img.size)
                     img = img.resize((int(img.width * ratio), int(img.height * ratio)), Image.LANCZOS)
                 text, model_used = generate_gemini_response(client, prompt_text, img, file.filename)
-                print(f'✅ Used model: {model_used}', flush=True)
                 if text.startswith('```'):
                     parts = text.split('```')
                     text = parts[1] if len(parts) > 1 else text
@@ -1498,10 +1217,7 @@ Rules:
                 output_path = os.path.join(temp_dir, f'output_{idx}.docx')
                 doc.save(output_path)
                 results.append((base_name, output_path))
-                print(f'✅ {file.filename} done', flush=True)
             except Exception as e:
-                import traceback
-                traceback.print_exc()
                 return f'AI Error ({file.filename}): {str(e)[:300]}', 500
         if not results: return 'No content extracted from any file.', 400
         if len(results) == 1:
@@ -1513,32 +1229,25 @@ Rules:
         zip_buffer.seek(0)
         return send_file(zip_buffer, mimetype='application/zip', as_attachment=True, download_name=f'Bharat24Tools_AI_{datetime.now().strftime("%Y%m%d_%H%M")}.zip')
     except Exception as e:
-        import traceback
-        traceback.print_exc()
         return f'Error: {str(e)}', 500
     finally:
         processing_lock.release()
         cleanup_dir(temp_dir)
 
-# ========== 25. IMAGE TO EXCEL ==========
+# ========== 22. IMAGE TO EXCEL ==========
 @app.route('/image-to-excel', methods=['POST'])
 def image_to_excel():
     if not processing_lock.acquire(timeout=300):
         return 'Server busy. Try again.', 503
     temp_dir = tempfile.mkdtemp()
     try:
-        if 'files' in request.files:
-            files = request.files.getlist('files')
-        elif 'file' in request.files:
-            files = [request.files['file']]
-        else:
-            return 'No files uploaded', 400
+        if 'files' in request.files: files = request.files.getlist('files')
+        elif 'file' in request.files: files = [request.files['file']]
+        else: return 'No files uploaded', 400
         files = [f for f in files if f and f.filename]
         if not files: return 'No files uploaded', 400
         if len(files) > 3: return 'Max 3 files allowed per request', 400
         from google import genai
-        from PIL import Image
-        import json
         from openpyxl import Workbook
         from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
         from openpyxl.utils import get_column_letter
@@ -1549,13 +1258,7 @@ def image_to_excel():
         prompt_text = """Extract ALL table data from this image.
 Return ONLY valid JSON, no explanation, no markdown:
 {"tables":[{"name":"Table 1","rows":[["cell1","cell2"],["cell3","cell4"]]}]}
-Rules:
-- Preserve EXACT text including Hindi/Devanagari
-- Each row is array of cell strings, keep same column count
-- If multiple tables, return multiple objects
-- If no table, treat whole content as one table
-- Empty cells = ""
-- Return ONLY JSON, nothing else"""
+Rules: - Preserve EXACT text including Hindi/Devanagari - Each row is array of cell strings, keep same column count - If multiple tables, return multiple objects - If no table, treat whole content as one table - Empty cells = "" - Return ONLY JSON, nothing else"""
         results = []
         for idx, file in enumerate(files):
             valid, msg = validate_file(file, allowed_ext=['.jpg', '.jpeg', '.png', '.webp', '.bmp', '.tiff', '.tif'], max_size=15 * 1024 * 1024)
@@ -1571,7 +1274,6 @@ Rules:
                     ratio = max_dim / max(img.size)
                     img = img.resize((int(img.width * ratio), int(img.height * ratio)), Image.LANCZOS)
                 text, model_used = generate_gemini_response(client, prompt_text, img, file.filename)
-                print(f'✅ Used model: {model_used}', flush=True)
                 if text.startswith('```'):
                     parts = text.split('```')
                     text = parts[1] if len(parts) > 1 else text
@@ -1622,10 +1324,7 @@ Rules:
                 output_path = os.path.join(temp_dir, f'output_{idx}.xlsx')
                 wb.save(output_path)
                 results.append((base_name, output_path))
-                print(f'✅ {file.filename} done', flush=True)
             except Exception as e:
-                import traceback
-                traceback.print_exc()
                 return f'AI Error ({file.filename}): {str(e)[:300]}', 500
         if not results: return 'No table data extracted from any file.', 400
         if len(results) == 1:
@@ -1637,22 +1336,19 @@ Rules:
         zip_buffer.seek(0)
         return send_file(zip_buffer, mimetype='application/zip', as_attachment=True, download_name=f'Bharat24Tools_AI_{datetime.now().strftime("%Y%m%d_%H%M")}.zip')
     except Exception as e:
-        import traceback
-        traceback.print_exc()
         return f'Error: {str(e)}', 500
     finally:
         processing_lock.release()
         cleanup_dir(temp_dir)
 
-# ========== 26. PDF WATERMARK ==========
+# ========== 23. PDF WATERMARK ==========
 @app.route('/pdf-watermark', methods=['POST'])
 def pdf_watermark():
     if not processing_lock.acquire(timeout=300):
         return 'Server busy. Try again.', 503
     temp_dir = tempfile.mkdtemp()
     try:
-        if 'file' not in request.files:
-            return 'No file uploaded', 400
+        if 'file' not in request.files: return 'No file uploaded', 400
         file = request.files['file']
         valid, msg = validate_file(file, allowed_ext=['.pdf'])
         if not valid: return msg, 400
@@ -1663,7 +1359,6 @@ def pdf_watermark():
         output_path = os.path.join(temp_dir, 'watermarked.pdf')
         file.save(input_path)
         from reportlab.pdfgen import canvas
-        from PyPDF2 import PdfReader, PdfWriter
         reader = PdfReader(input_path)
         writer = PdfWriter()
         for page in reader.pages:
@@ -1684,21 +1379,19 @@ def pdf_watermark():
         with open(output_path, 'wb') as f: writer.write(f)
         return send_file(output_path, mimetype='application/pdf', as_attachment=True, download_name='watermarked.pdf')
     except Exception as e:
-        print(f'❌ Watermark error: {e}', flush=True)
         return f'Error: {str(e)}', 500
     finally:
         processing_lock.release()
         cleanup_dir(temp_dir)
 
-# ========== 27. PDF PAGE DELETE ==========
+# ========== 24. PDF PAGE DELETE ==========
 @app.route('/pdf-page-delete', methods=['POST'])
 def pdf_page_delete():
     if not processing_lock.acquire(timeout=300):
         return 'Server busy. Try again.', 503
     temp_dir = tempfile.mkdtemp()
     try:
-        if 'file' not in request.files:
-            return 'No file uploaded', 400
+        if 'file' not in request.files: return 'No file uploaded', 400
         file = request.files['file']
         valid, msg = validate_file(file, allowed_ext=['.pdf'])
         if not valid: return msg, 400
@@ -1715,16 +1408,13 @@ def pdf_page_delete():
                 delete_pages.update(range(int(start), int(end) + 1))
             else:
                 delete_pages.add(int(part))
-        from PyPDF2 import PdfReader, PdfWriter
         reader = PdfReader(input_path)
         writer = PdfWriter()
         for i, page in enumerate(reader.pages):
-            if (i + 1) not in delete_pages:
-                writer.add_page(page)
+            if (i + 1) not in delete_pages: writer.add_page(page)
         with open(output_path, 'wb') as f: writer.write(f)
         return send_file(output_path, mimetype='application/pdf', as_attachment=True, download_name='pages-deleted.pdf')
     except Exception as e:
-        print(f'❌ Page Delete error: {e}', flush=True)
         return f'Error: {str(e)}', 500
     finally:
         processing_lock.release()
