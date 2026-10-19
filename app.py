@@ -90,7 +90,7 @@ HTML = '''
         <div class="endpoint"><code>POST /pdf-to-excel</code><span class="desc">PDF to Excel</span></div>
         <div class="endpoint"><code>POST /excel-to-image</code><span class="desc">Excel to Image</span></div>
         <div class="endpoint"><code>POST /merge-pdf</code><span class="desc">Merge PDFs</span></div>
-        <div class="endpoint"><code>POST /split-pdf</code><span class="desc">Split PDF</span></div>
+        <div class="endpoint"><code>POST /split-pdf</code><span class="desc">Split PDF ✅ Advanced Visual Mode</span></div>
         <div class="endpoint"><code>POST /rotate-pdf</code><span class="desc">Rotate PDF</span></div>
         <div class="endpoint"><code>POST /protect-pdf</code><span class="desc">Protect PDF</span></div>
         <div class="endpoint"><code>POST /unlock-pdf</code><span class="desc">Unlock PDF</span></div>
@@ -790,7 +790,7 @@ def merge_pdf():
         processing_lock.release()
         cleanup_dir(temp_dir)
 
-# ========== 10. SPLIT PDF ==========
+# ========== 10. SPLIT PDF (FIXED & ADVANCED) ==========
 @app.route('/split-pdf', methods=['POST'])
 def split_pdf():
     if not processing_lock.acquire(timeout=300):
@@ -801,28 +801,96 @@ def split_pdf():
             return 'No file uploaded', 400
         file = request.files['file']
         valid, msg = validate_file(file, allowed_ext=['.pdf'])
-        if not valid: return msg, 400
+        if not valid: 
+            return msg, 400
+            
+        mode = request.form.get('mode', 'custom')
+        ranges_input = request.form.get('ranges', '').strip()
+        fixed_size = request.form.get('fixed_size', '1')
+
         input_path = os.path.join(temp_dir, 'input.pdf')
         file.save(input_path)
+
+        from PyPDF2 import PdfReader, PdfWriter
+        import io
+        import zipfile
+
         try:
-            result = subprocess.run(['qpdf', '--show-npages', input_path], capture_output=True, text=True, timeout=30)
-            total_pages = int(result.stdout.strip())
-        except: total_pages = 0
-        if total_pages == 0: return 'Cannot read PDF page count', 400
-        output_pattern = os.path.join(temp_dir, 'page-%03d.pdf')
-        cmd = ['qpdf', '--split-pages', '1', input_path, output_pattern]
-        subprocess.run(cmd, check=True, timeout=PROCESSING_TIMEOUT, capture_output=True)
-        pdf_files = sorted([f for f in os.listdir(temp_dir) if f.startswith('page-') and f.endswith('.pdf')])
-        if not pdf_files: return 'Split failed', 500
-        if len(pdf_files) == 1:
-            return send_file(os.path.join(temp_dir, pdf_files[0]), mimetype='application/pdf', as_attachment=True, download_name='page-1.pdf')
-        zip_buffer = io.BytesIO()
-        with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
-            for pdf in pdf_files: zf.write(os.path.join(temp_dir, pdf), pdf)
-        zip_buffer.seek(0)
-        return send_file(zip_buffer, mimetype='application/zip', as_attachment=True, download_name='split-pages.zip')
+            reader = PdfReader(input_path)
+            total_pages = len(reader.pages)
+        except Exception as e:
+            return 'Error: PDF file is corrupted or password protected.', 400
+
+        if total_pages == 0:
+            return 'PDF has no pages', 400
+
+        # --- MODE 1: CUSTOM RANGE (Visual Selection) ---
+        if mode == 'custom':
+            if not ranges_input:
+                return 'Please select at least one page.', 400
+
+            pages_to_extract = set()
+            parts = ranges_input.split(',')
+            for part in parts:
+                part = part.strip()
+                if '-' in part:
+                    try:
+                        start, end = map(int, part.split('-'))
+                        if start > end: start, end = end, start
+                        start = max(1, start)
+                        end = min(total_pages, end)
+                        for p in range(start, end + 1):
+                            pages_to_extract.add(p - 1)
+                    except ValueError:
+                        continue
+                elif part.isdigit():
+                    p = int(part)
+                    if 1 <= p <= total_pages:
+                        pages_to_extract.add(p - 1)
+
+            if not pages_to_extract:
+                return 'No valid pages found.', 400
+
+            writer = PdfWriter()
+            for p_idx in sorted(pages_to_extract):
+                writer.add_page(reader.pages[p_idx])
+
+            output_path = os.path.join(temp_dir, 'extracted.pdf')
+            with open(output_path, 'wb') as f:
+                writer.write(f)
+
+            return send_file(output_path, mimetype='application/pdf', as_attachment=True, download_name='extracted-pages.pdf')
+
+        # --- MODE 2: SPLIT EVERY X PAGES ---
+        elif mode == 'fixed':
+            try:
+                chunk_size = int(fixed_size)
+                if chunk_size < 1: chunk_size = 1
+            except:
+                chunk_size = 1
+
+            zip_buffer = io.BytesIO()
+            with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
+                for i in range(0, total_pages, chunk_size):
+                    writer = PdfWriter()
+                    end = min(i + chunk_size, total_pages)
+                    for p_idx in range(i, end):
+                        writer.add_page(reader.pages[p_idx])
+                    
+                    part_filename = f'part_{i//chunk_size + 1:02d}_pages_{i+1}_to_{end}.pdf'
+                    part_path = os.path.join(temp_dir, part_filename)
+                    with open(part_path, 'wb') as f:
+                        writer.write(f)
+                    zf.write(part_path, part_filename)
+
+            zip_buffer.seek(0)
+            return send_file(zip_buffer, mimetype='application/zip', as_attachment=True, download_name='split_pdfs.zip')
+        
+        return 'Invalid mode.', 400
+
     except Exception as e:
-        print(f'❌ Split error: {e}', flush=True)
+        import traceback
+        traceback.print_exc()
         return f'Error: {str(e)}', 500
     finally:
         processing_lock.release()
