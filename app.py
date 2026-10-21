@@ -225,69 +225,103 @@ def compress():
         method_used = "Standard"
         target_hit = ""
 
-        # ==================================================
-        # ADVANCED AI LOGIC: Fast & Exact Size
-        # ==================================================
+        # ✅ NAYA FIX: `-dNOINTERPOLATE` add kiya gaya hai memory crash rokne ke liye
+        def build_gs_cmd(inp, outp, dpi_val, jpeg_quality, pdf_settings, gray=False):
+            cmd = ['gs', '-sDEVICE=pdfwrite', '-dCompatibilityLevel=1.4', f'-dPDFSETTINGS={pdf_settings}', '-dNOPAUSE', '-dQUIET', '-dBATCH', '-dNOINTERPOLATE', '-dDetectDuplicateImages=true', '-dDownsampleColorImages=true', f'-dColorImageResolution={dpi_val}', '-dDownsampleGrayImages=true', f'-dGrayImageResolution={dpi_val}', '-dDownsampleMonoImages=true', f'-dMonoImageResolution={dpi_val}', f'-dJPEGQ={jpeg_quality}', '-dAutoRotatePages=/None']
+            if grayscale or gray:
+                cmd.extend(['-sColorConversionStrategy=Gray', '-dProcessColorModel=/DeviceGray'])
+            cmd.extend([f'-sOutputFile={outp}', inp])
+            return cmd
+
+        # ✅ FALLBACK LOGIC: Agar Ghostscript fail ho toh PyPDF2 use karo
+        def fallback_compression(inp, outp):
+            try:
+                from PyPDF2 import PdfReader, PdfWriter
+                print("⚠️ Ghostscript failed. Activating PyPDF2 Fallback...", flush=True)
+                reader = PdfReader(inp)
+                writer = PdfWriter()
+                for page in reader.pages:
+                    writer.add_page(page)
+                # Basic structural compression
+                writer.compress_identical_objects()
+                with open(outp, 'wb') as f:
+                    writer.write(f)
+                return True
+            except Exception as e:
+                print(f"❌ PyPDF2 Fallback also failed: {e}", flush=True)
+                return False
+
         if target_size > 0 and target_size < input_size:
             print(f'🎯 Target: {target_size/1024:.1f}KB (Original: {input_size/1024:.1f}KB)', flush=True)
             
-            # SMART ROUTING: Agar target original size ka 25% se kam hai (e.g. 2MB -> 100KB)
-            # Toh direct Scanner Mode on karo.
             if target_size < (input_size * 0.25):
                 print("⚡ Extreme size detected. Activating AI Scanner Mode...", flush=True)
-                
                 min_dpi, max_dpi = 10, 50
                 attempts = 0
                 jpg_files = []
-                raster_path = None # Initialize to avoid UnboundLocalError
+                raster_path = None
                 
-                while attempts < 4: # Max 4 attempts for speed
+                while attempts < 4:
                     attempts += 1
                     current_dpi = (min_dpi + max_dpi) // 2
                     
-                    # Cleanup previous JPGs
                     for f in glob.glob(f'{temp_dir}/page-*.jpg'): os.remove(f)
                     
-                    # 1. Convert PDF pages to JPEGs
                     jpg_pattern = f'{temp_dir}/page-%03d.jpg'
                     color_strategy = '-sColorConversionStrategy=Gray' if grayscale else '-sColorConversionStrategy=RGB'
                     
-                    subprocess.run([
-                        'gs', '-dNOPAUSE', '-dBATCH', '-dQUIET', '-sDEVICE=jpeg', 
-                        f'-r{current_dpi}', '-dJPEGQ=30', color_strategy,
-                        f'-sOutputFile={jpg_pattern}', input_path
-                    ], check=True, timeout=15, capture_output=True)
+                    try:
+                        subprocess.run([
+                            'gs', '-dNOPAUSE', '-dBATCH', '-dQUIET', '-sDEVICE=jpeg', 
+                            f'-r{current_dpi}', '-dJPEGQ=30', color_strategy,
+                            f'-sOutputFile={jpg_pattern}', input_path
+                        ], check=True, timeout=15, capture_output=True)
+                    except subprocess.CalledProcessError as e:
+                        print(f"  ⚠️ Ghostscript Rasterize crashed (Code: {e.returncode}). Trying fallback...", flush=True)
+                        if fallback_compression(input_path, output_path):
+                            target_hit = f'Fallback ({os.path.getsize(output_path)/1024:.1f}KB)'
+                            method_used = "PyPDF2 Fallback"
+                            break
+                        else:
+                            return 'This PDF is too complex to compress. Please try a smaller file.', 400
                     
                     jpg_files = sorted(glob.glob(jpg_pattern))
                     if not jpg_files: break
                     
-                    # 2. Convert JPEGs back to PDF using Ghostscript
                     raster_path = os.path.join(temp_dir, f'raster_{attempts}.pdf')
-                    subprocess.run([
-                        'gs', '-sDEVICE=pdfwrite', '-dCompatibilityLevel=1.4', 
-                        '-dNOPAUSE', '-dQUIET', '-dBATCH', 
-                        f'-sOutputFile={raster_path}'
-                    ] + jpg_files, check=True, timeout=15, capture_output=True)
-                    
-                    out_size = os.path.getsize(raster_path)
-                    print(f'  [Scanner Mode {attempts}] DPI:{current_dpi} -> {out_size/1024:.1f}KB', flush=True)
-                    
-                    if out_size <= target_size:
-                        shutil.copy(raster_path, output_path)
-                        target_hit = f'Exact Hit ({out_size/1024:.1f}KB)'
-                        method_used = "AI Extreme Scanner"
-                        break
-                    else:
-                        max_dpi = current_dpi - 2 
+                    try:
+                        subprocess.run([
+                            'gs', '-sDEVICE=pdfwrite', '-dCompatibilityLevel=1.4', 
+                            '-dNOPAUSE', '-dQUIET', '-dBATCH', 
+                            f'-sOutputFile={raster_path}'
+                        ] + jpg_files, check=True, timeout=15, capture_output=True)
+                    except subprocess.CalledProcessError as e:
+                        print(f"  ⚠️ Ghostscript Merge crashed (Code: {e.returncode}). Trying fallback...", flush=True)
+                        if fallback_compression(input_path, output_path):
+                            target_hit = f'Fallback ({os.path.getsize(output_path)/1024:.1f}KB)'
+                            method_used = "PyPDF2 Fallback"
+                            break
+                        else:
+                            return 'This PDF is too complex to compress. Please try a smaller file.', 400
+
+                    if os.path.exists(raster_path):
+                        out_size = os.path.getsize(raster_path)
+                        print(f'  [Scanner Mode {attempts}] DPI:{current_dpi} -> {out_size/1024:.1f}KB', flush=True)
                         
-                # Fallback agar loop fail ho jaye (Target hit na ho)
+                        if out_size <= target_size:
+                            shutil.copy(raster_path, output_path)
+                            target_hit = f'Exact Hit ({out_size/1024:.1f}KB)'
+                            method_used = "AI Extreme Scanner"
+                            break
+                        else:
+                            max_dpi = current_dpi - 2 
+                            
                 if not os.path.exists(output_path) and raster_path and os.path.exists(raster_path):
                     shutil.copy(raster_path, output_path)
                     target_hit = f'Closest ({os.path.getsize(output_path)/1024:.1f}KB)'
                     method_used = "AI Scanner (Limit)"
 
             else:
-                # Standard Ghostscript Compression (Text-Safe)
                 print("🔧 Applying Standard Text-Safe Compression...", flush=True)
                 min_dpi, max_dpi = 20, 150
                 attempts = 0
@@ -299,18 +333,18 @@ def compress():
                     mid_quality = max(10, min(80, int((mid_dpi / 150) * 70) + 10))
                     attempt_path = os.path.join(temp_dir, f'attempt_{attempts}.pdf')
                     
-                    cmd = [
-                        'gs', '-sDEVICE=pdfwrite', '-dCompatibilityLevel=1.4', 
-                        '-dPDFSETTINGS=/screen', '-dNOPAUSE', '-dQUIET', '-dBATCH', 
-                        '-dDownsampleColorImages=true', f'-dColorImageResolution={mid_dpi}', 
-                        '-dDownsampleGrayImages=true', f'-dGrayImageResolution={mid_dpi}', 
-                        f'-dJPEGQ={mid_quality}', '-dAutoRotatePages=/None'
-                    ]
-                    if grayscale:
-                        cmd.extend(['-sColorConversionStrategy=Gray', '-dProcessColorModel=/DeviceGray'])
-                    cmd.extend([f'-sOutputFile={attempt_path}', input_path])
+                    cmd = build_gs_cmd(input_path, attempt_path, mid_dpi, mid_quality, '/screen')
                     
-                    subprocess.run(cmd, check=True, timeout=15, capture_output=True)
+                    try:
+                        subprocess.run(cmd, check=True, timeout=15, capture_output=True)
+                    except subprocess.CalledProcessError as e:
+                        print(f"  ⚠️ Ghostscript Standard crashed (Code: {e.returncode}). Trying fallback...", flush=True)
+                        if fallback_compression(input_path, output_path):
+                            target_hit = f'Fallback ({os.path.getsize(output_path)/1024:.1f}KB)'
+                            method_used = "PyPDF2 Fallback"
+                            break
+                        else:
+                            return 'This PDF is too complex to compress. Please try a smaller file.', 400
                     
                     if os.path.exists(attempt_path):
                         out_size = os.path.getsize(attempt_path)
@@ -331,23 +365,26 @@ def compress():
 
         else:
             # Normal Compression (No target specified)
-            cmd = ['gs', '-sDEVICE=pdfwrite', '-dPDFSETTINGS=/screen', '-dNOPAUSE', '-dQUIET', '-dBATCH', f'-sOutputFile={output_path}', input_path]
-            subprocess.run(cmd, check=True, timeout=30, capture_output=True)
-            method_used = "Normal Compress"
-            target_hit = f"Done ({os.path.getsize(output_path)/1024:.1f}KB)"
+            cmd = build_gs_cmd(input_path, output_path, 72, 50, '/screen')
+            try:
+                subprocess.run(cmd, check=True, timeout=30, capture_output=True)
+                method_used = "Normal Compress"
+                target_hit = f"Done ({os.path.getsize(output_path)/1024:.1f}KB)"
+            except subprocess.CalledProcessError as e:
+                print(f"⚠️ Ghostscript Normal crashed. Trying fallback...", flush=True)
+                if fallback_compression(input_path, output_path):
+                    method_used = "PyPDF2 Fallback"
+                    target_hit = f"Fallback ({os.path.getsize(output_path)/1024:.1f}KB)"
 
-        # ==================================================
         # ULTIMATE FALLBACK (Safety Net)
-        # ==================================================
-        # Agar upar ke kisi bhi step me file nahi bani, toh standard compress karke do
         if not os.path.exists(output_path):
-            print("🚨 Ultimate Fallback Activated: Output file missing. Applying standard compression.", flush=True)
-            cmd = ['gs', '-sDEVICE=pdfwrite', '-dPDFSETTINGS=/screen', '-dNOPAUSE', '-dQUIET', '-dBATCH', f'-sOutputFile={output_path}', input_path]
-            subprocess.run(cmd, check=True, timeout=30, capture_output=True)
-            method_used = "Fallback Standard"
-            target_hit = "Best Effort"
+            print("🚨 Ultimate Fallback Activated: Output file missing.", flush=True)
+            if fallback_compression(input_path, output_path):
+                method_used = "Fallback Standard"
+                target_hit = "Best Effort"
+            else:
+                return 'Compression failed: Could not generate output file.', 500
 
-        # Final check (Agar ab bhi file nahi bani toh error throw karo cleanly)
         if not os.path.exists(output_path):
             return 'Compression failed: Could not generate output file.', 500
 
