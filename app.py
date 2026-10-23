@@ -18,7 +18,7 @@ MAX_FILE_SIZE = 20 * 1024 * 1024
 MAX_FILES_COUNT = 20
 PROCESSING_TIMEOUT = 120
 CLEANUP_DELAY = 30
-ATTEMPT_TIMEOUT = 20
+ATTEMPT_TIMEOUT = 120 # ✅ INCREASED from 20 to 120 for Render Free Tier
 
 processing_lock = threading.Lock()
 
@@ -225,7 +225,6 @@ def compress():
         method_used = "Standard"
         target_hit = ""
 
-        # ✅ NAYA FIX: `-dNOINTERPOLATE` add kiya gaya hai memory crash rokne ke liye
         def build_gs_cmd(inp, outp, dpi_val, jpeg_quality, pdf_settings, gray=False):
             cmd = ['gs', '-sDEVICE=pdfwrite', '-dCompatibilityLevel=1.4', f'-dPDFSETTINGS={pdf_settings}', '-dNOPAUSE', '-dQUIET', '-dBATCH', '-dNOINTERPOLATE', '-dDetectDuplicateImages=true', '-dDownsampleColorImages=true', f'-dColorImageResolution={dpi_val}', '-dDownsampleGrayImages=true', f'-dGrayImageResolution={dpi_val}', '-dDownsampleMonoImages=true', f'-dMonoImageResolution={dpi_val}', f'-dJPEGQ={jpeg_quality}', '-dAutoRotatePages=/None']
             if grayscale or gray:
@@ -233,16 +232,14 @@ def compress():
             cmd.extend([f'-sOutputFile={outp}', inp])
             return cmd
 
-        # ✅ FALLBACK LOGIC: Agar Ghostscript fail ho toh PyPDF2 use karo
         def fallback_compression(inp, outp):
             try:
                 from PyPDF2 import PdfReader, PdfWriter
-                print("⚠️ Ghostscript failed. Activating PyPDF2 Fallback...", flush=True)
+                print("⚠️ Ghostscript failed or timed out. Activating PyPDF2 Fallback...", flush=True)
                 reader = PdfReader(inp)
                 writer = PdfWriter()
                 for page in reader.pages:
                     writer.add_page(page)
-                # Basic structural compression
                 writer.compress_identical_objects()
                 with open(outp, 'wb') as f:
                     writer.write(f)
@@ -275,9 +272,9 @@ def compress():
                             'gs', '-dNOPAUSE', '-dBATCH', '-dQUIET', '-sDEVICE=jpeg', 
                             f'-r{current_dpi}', '-dJPEGQ=30', color_strategy,
                             f'-sOutputFile={jpg_pattern}', input_path
-                        ], check=True, timeout=15, capture_output=True)
-                    except subprocess.CalledProcessError as e:
-                        print(f"  ⚠️ Ghostscript Rasterize crashed (Code: {e.returncode}). Trying fallback...", flush=True)
+                        ], check=True, timeout=ATTEMPT_TIMEOUT, capture_output=True)
+                    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+                        print(f"  ⚠️ Ghostscript Rasterize failed/timed out. Trying fallback...", flush=True)
                         if fallback_compression(input_path, output_path):
                             target_hit = f'Fallback ({os.path.getsize(output_path)/1024:.1f}KB)'
                             method_used = "PyPDF2 Fallback"
@@ -294,9 +291,9 @@ def compress():
                             'gs', '-sDEVICE=pdfwrite', '-dCompatibilityLevel=1.4', 
                             '-dNOPAUSE', '-dQUIET', '-dBATCH', 
                             f'-sOutputFile={raster_path}'
-                        ] + jpg_files, check=True, timeout=15, capture_output=True)
-                    except subprocess.CalledProcessError as e:
-                        print(f"  ⚠️ Ghostscript Merge crashed (Code: {e.returncode}). Trying fallback...", flush=True)
+                        ] + jpg_files, check=True, timeout=ATTEMPT_TIMEOUT, capture_output=True)
+                    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+                        print(f"  ⚠️ Ghostscript Merge failed/timed out. Trying fallback...", flush=True)
                         if fallback_compression(input_path, output_path):
                             target_hit = f'Fallback ({os.path.getsize(output_path)/1024:.1f}KB)'
                             method_used = "PyPDF2 Fallback"
@@ -336,9 +333,9 @@ def compress():
                     cmd = build_gs_cmd(input_path, attempt_path, mid_dpi, mid_quality, '/screen')
                     
                     try:
-                        subprocess.run(cmd, check=True, timeout=15, capture_output=True)
-                    except subprocess.CalledProcessError as e:
-                        print(f"  ⚠️ Ghostscript Standard crashed (Code: {e.returncode}). Trying fallback...", flush=True)
+                        subprocess.run(cmd, check=True, timeout=ATTEMPT_TIMEOUT, capture_output=True)
+                    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+                        print(f"  ⚠️ Ghostscript Standard failed/timed out. Trying fallback...", flush=True)
                         if fallback_compression(input_path, output_path):
                             target_hit = f'Fallback ({os.path.getsize(output_path)/1024:.1f}KB)'
                             method_used = "PyPDF2 Fallback"
@@ -367,11 +364,11 @@ def compress():
             # Normal Compression (No target specified)
             cmd = build_gs_cmd(input_path, output_path, 72, 50, '/screen')
             try:
-                subprocess.run(cmd, check=True, timeout=30, capture_output=True)
+                subprocess.run(cmd, check=True, timeout=ATTEMPT_TIMEOUT, capture_output=True)
                 method_used = "Normal Compress"
                 target_hit = f"Done ({os.path.getsize(output_path)/1024:.1f}KB)"
-            except subprocess.CalledProcessError as e:
-                print(f"⚠️ Ghostscript Normal crashed. Trying fallback...", flush=True)
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+                print(f"⚠️ Ghostscript Normal failed/timed out. Trying fallback...", flush=True)
                 if fallback_compression(input_path, output_path):
                     method_used = "PyPDF2 Fallback"
                     target_hit = f"Fallback ({os.path.getsize(output_path)/1024:.1f}KB)"
