@@ -16,7 +16,7 @@ CORS(app)
 
 MAX_FILE_SIZE = 20 * 1024 * 1024
 MAX_FILES_COUNT = 20
-PROCESSING_TIMEOUT = 120 # ✅ Increased for Render
+PROCESSING_TIMEOUT = 120
 CLEANUP_DELAY = 30
 ATTEMPT_TIMEOUT = 120 
 
@@ -79,8 +79,8 @@ HTML = '''
 <body>
     <div class="container">
         <h1>⚡ Bharat24Tools API v9.9</h1>
-        <p class="status-badge">Server is running ✅ — 24 Tools Active</p>
-        <div class="section-title">📄 PDF Tools (13)</div>
+        <p class="status-badge">Server is running ✅ — 23 Tools Active (1 Client-side)</p>
+        <div class="section-title">📄 PDF Tools (12)</div>
         <div class="endpoint"><code>POST /compress</code><span class="desc">Compress PDF ✅ AI Scanner Mode (10KB Min)</span></div>
         <div class="endpoint"><code>POST /pdf-to-jpg</code><span class="desc">PDF to Images</span></div>
         <div class="endpoint"><code>POST /jpg-to-pdf</code><span class="desc">Images to PDF</span></div>
@@ -104,8 +104,7 @@ HTML = '''
         <div class="endpoint"><code>POST /image-to-word</code><span class="desc">Image to Word ✅ AI + Fallback</span></div>
         <div class="endpoint"><code>POST /image-to-excel</code><span class="desc">Image to Excel ✅ AI + Fallback</span></div>
         <div class="endpoint"><code>POST /pdf-watermark</code><span class="desc">PDF Watermark</span></div>
-        <div class="endpoint"><code>POST /pdf-page-delete</code><span class="desc">PDF Page Delete</span></div>
-        <p class="footer">Version 9.9 — 24 Tools | AI Scanner Compression</p>
+        <p class="footer">Version 9.9 — 23 Tools | AI Scanner Compression</p>
     </div>
 </body>
 </html>
@@ -178,7 +177,7 @@ def health():
         'status': 'ok',
         'service': 'bharat24tools-api',
         'version': '9.9',
-        'tools': 24,
+        'tools': 23,
         'ocr_engine': 'gemini-3.8-flash (with fallback)',
         'sdk': 'google-genai',
         'gemini_configured': bool(os.environ.get('GEMINI_API_KEY', '').strip()),
@@ -217,7 +216,7 @@ def compress():
         except:
             target_size = 0
 
-        MIN_TARGET = 10 * 1024 # 10KB minimum
+        MIN_TARGET = 10 * 1024 
         if target_size > 0 and target_size < MIN_TARGET:
             target_size = MIN_TARGET
 
@@ -361,7 +360,6 @@ def compress():
                     method_used = "Smart Text-Safe (Limit)"
 
         else:
-            # Normal Compression (No target specified)
             cmd = build_gs_cmd(input_path, output_path, 72, 50, '/screen')
             try:
                 subprocess.run(cmd, check=True, timeout=ATTEMPT_TIMEOUT, capture_output=True)
@@ -373,7 +371,6 @@ def compress():
                     method_used = "PyPDF2 Fallback"
                     target_hit = f"Fallback ({os.path.getsize(output_path)/1024:.1f}KB)"
 
-        # ULTIMATE FALLBACK (Safety Net)
         if not os.path.exists(output_path):
             print("🚨 Ultimate Fallback Activated: Output file missing.", flush=True)
             if fallback_compression(input_path, output_path):
@@ -402,7 +399,7 @@ def compress():
         processing_lock.release()
         cleanup_dir(temp_dir)
 
-# ========== 2. PDF TO JPG (FIXED TIMEOUT) ==========
+# ========== 2. PDF TO JPG ==========
 @app.route('/pdf-to-jpg', methods=['POST'])
 def pdf_to_jpg():
     if not processing_lock.acquire(timeout=300):
@@ -420,7 +417,6 @@ def pdf_to_jpg():
         file.save(input_path)
         output_pattern = os.path.join(temp_dir, 'page-%03d.jpg')
         
-        # ✅ TIMEOUT INCREASED TO 120 SECONDS and MEMORY OPTIMIZED
         subprocess.run([
             'gs', '-dNOPAUSE', '-dBATCH', '-dQUIET', 
             '-sDEVICE=jpeg', '-r150', '-dJPEGQ=90', '-dMaxBitmap=500000000',
@@ -835,7 +831,7 @@ def merge_pdf():
         processing_lock.release()
         cleanup_dir(temp_dir)
 
-# ========== 10. SPLIT PDF (FIXED & ADVANCED) ==========
+# ========== 10. SPLIT PDF ==========
 @app.route('/split-pdf', methods=['POST'])
 def split_pdf():
     if not processing_lock.acquire(timeout=300):
@@ -869,7 +865,6 @@ def split_pdf():
         if total_pages == 0:
             return 'PDF has no pages', 400
 
-        # --- MODE 1: CUSTOM RANGE (Visual Selection) ---
         if mode == 'custom':
             if not ranges_input:
                 return 'Please select at least one page.', 400
@@ -906,7 +901,6 @@ def split_pdf():
 
             return send_file(output_path, mimetype='application/pdf', as_attachment=True, download_name='extracted-pages.pdf')
 
-        # --- MODE 2: SPLIT EVERY X PAGES ---
         elif mode == 'fixed':
             try:
                 chunk_size = int(fixed_size)
@@ -1669,46 +1663,6 @@ def pdf_watermark():
         return send_file(output_path, mimetype='application/pdf', as_attachment=True, download_name='watermarked.pdf')
     except Exception as e:
         print(f'❌ Watermark error: {e}', flush=True)
-        return f'Error: {str(e)}', 500
-    finally:
-        processing_lock.release()
-        cleanup_dir(temp_dir)
-
-# ========== 24. PDF PAGE DELETE ==========
-@app.route('/pdf-page-delete', methods=['POST'])
-def pdf_page_delete():
-    if not processing_lock.acquire(timeout=300):
-        return 'Server busy. Try again.', 503
-    temp_dir = tempfile.mkdtemp()
-    try:
-        if 'file' not in request.files:
-            return 'No file uploaded', 400
-        file = request.files['file']
-        valid, msg = validate_file(file, allowed_ext=['.pdf'])
-        if not valid: return msg, 400
-        pages_to_delete = request.form.get('pages', '').strip()
-        if not pages_to_delete: return 'Page numbers required', 400
-        input_path = os.path.join(temp_dir, 'input.pdf')
-        output_path = os.path.join(temp_dir, 'output.pdf')
-        file.save(input_path)
-        delete_pages = set()
-        for part in pages_to_delete.split(','):
-            part = part.strip()
-            if '-' in part:
-                start, end = part.split('-')
-                delete_pages.update(range(int(start), int(end) + 1))
-            else:
-                delete_pages.add(int(part))
-        from PyPDF2 import PdfReader, PdfWriter
-        reader = PdfReader(input_path)
-        writer = PdfWriter()
-        for i, page in enumerate(reader.pages):
-            if (i + 1) not in delete_pages:
-                writer.add_page(page)
-        with open(output_path, 'wb') as f: writer.write(f)
-        return send_file(output_path, mimetype='application/pdf', as_attachment=True, download_name='pages-deleted.pdf')
-    except Exception as e:
-        print(f'❌ Page Delete error: {e}', flush=True)
         return f'Error: {str(e)}', 500
     finally:
         processing_lock.release()
