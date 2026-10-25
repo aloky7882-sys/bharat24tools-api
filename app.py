@@ -16,9 +16,9 @@ CORS(app)
 
 MAX_FILE_SIZE = 20 * 1024 * 1024
 MAX_FILES_COUNT = 20
-PROCESSING_TIMEOUT = 120
+PROCESSING_TIMEOUT = 120 # ✅ Increased for Render
 CLEANUP_DELAY = 30
-ATTEMPT_TIMEOUT = 120 # ✅ INCREASED from 20 to 120 for Render Free Tier
+ATTEMPT_TIMEOUT = 120 
 
 processing_lock = threading.Lock()
 
@@ -226,7 +226,7 @@ def compress():
         target_hit = ""
 
         def build_gs_cmd(inp, outp, dpi_val, jpeg_quality, pdf_settings, gray=False):
-            cmd = ['gs', '-sDEVICE=pdfwrite', '-dCompatibilityLevel=1.4', f'-dPDFSETTINGS={pdf_settings}', '-dNOPAUSE', '-dQUIET', '-dBATCH', '-dNOINTERPOLATE', '-dDetectDuplicateImages=true', '-dDownsampleColorImages=true', f'-dColorImageResolution={dpi_val}', '-dDownsampleGrayImages=true', f'-dGrayImageResolution={dpi_val}', '-dDownsampleMonoImages=true', f'-dMonoImageResolution={dpi_val}', f'-dJPEGQ={jpeg_quality}', '-dAutoRotatePages=/None']
+            cmd = ['gs', '-sDEVICE=pdfwrite', '-dCompatibilityLevel=1.4', f'-dPDFSETTINGS={pdf_settings}', '-dNOPAUSE', '-dQUIET', '-dBATCH', '-dNOINTERPOLATE', '-dDetectDuplicateImages=true', '-dDownsampleColorImages=true', f'-dColorImageResolution={dpi_val}', '-dDownsampleGrayImages=true', f'-dGrayImageResolution={dpi_val}', '-dDownsampleMonoImages=true', f'-dMonoImageResolution={dpi_val}', f'-dJPEGQ={jpeg_quality}', '-dAutoRotatePages=/None', '-dMaxBitmap=500000000']
             if grayscale or gray:
                 cmd.extend(['-sColorConversionStrategy=Gray', '-dProcessColorModel=/DeviceGray'])
             cmd.extend([f'-sOutputFile={outp}', inp])
@@ -270,7 +270,7 @@ def compress():
                     try:
                         subprocess.run([
                             'gs', '-dNOPAUSE', '-dBATCH', '-dQUIET', '-sDEVICE=jpeg', 
-                            f'-r{current_dpi}', '-dJPEGQ=30', color_strategy,
+                            f'-r{current_dpi}', '-dJPEGQ=30', color_strategy, '-dMaxBitmap=500000000',
                             f'-sOutputFile={jpg_pattern}', input_path
                         ], check=True, timeout=ATTEMPT_TIMEOUT, capture_output=True)
                     except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
@@ -289,7 +289,7 @@ def compress():
                     try:
                         subprocess.run([
                             'gs', '-sDEVICE=pdfwrite', '-dCompatibilityLevel=1.4', 
-                            '-dNOPAUSE', '-dQUIET', '-dBATCH', 
+                            '-dNOPAUSE', '-dQUIET', '-dBATCH', '-dMaxBitmap=500000000',
                             f'-sOutputFile={raster_path}'
                         ] + jpg_files, check=True, timeout=ATTEMPT_TIMEOUT, capture_output=True)
                     except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
@@ -402,7 +402,7 @@ def compress():
         processing_lock.release()
         cleanup_dir(temp_dir)
 
-# ========== 2. PDF TO JPG ==========
+# ========== 2. PDF TO JPG (FIXED TIMEOUT) ==========
 @app.route('/pdf-to-jpg', methods=['POST'])
 def pdf_to_jpg():
     if not processing_lock.acquire(timeout=300):
@@ -415,23 +415,34 @@ def pdf_to_jpg():
         valid, msg = validate_file(file, allowed_ext=['.pdf'])
         if not valid:
             return msg, 400
+        
         input_path = os.path.join(temp_dir, 'input.pdf')
         file.save(input_path)
         output_pattern = os.path.join(temp_dir, 'page-%03d.jpg')
-        subprocess.run(['gs', '-dNOPAUSE', '-dBATCH', '-dQUIET', '-sDEVICE=jpeg', '-r150', '-dJPEGQ=90', f'-sOutputFile={output_pattern}', input_path], check=True, timeout=PROCESSING_TIMEOUT, capture_output=True)
+        
+        # ✅ TIMEOUT INCREASED TO 120 SECONDS and MEMORY OPTIMIZED
+        subprocess.run([
+            'gs', '-dNOPAUSE', '-dBATCH', '-dQUIET', 
+            '-sDEVICE=jpeg', '-r150', '-dJPEGQ=90', '-dMaxBitmap=500000000',
+            f'-sOutputFile={output_pattern}', input_path
+        ], check=True, timeout=PROCESSING_TIMEOUT, capture_output=True)
+        
         jpg_files = sorted([f for f in os.listdir(temp_dir) if f.startswith('page-') and f.endswith('.jpg')])
         if not jpg_files:
             return 'No pages converted', 500
+            
         if len(jpg_files) == 1:
             return send_file(os.path.join(temp_dir, jpg_files[0]), mimetype='image/jpeg', as_attachment=True, download_name='page-1.jpg')
+        
         zip_buffer = io.BytesIO()
         with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
             for jpg in jpg_files:
                 zf.write(os.path.join(temp_dir, jpg), jpg)
         zip_buffer.seek(0)
         return send_file(zip_buffer, mimetype='application/zip', as_attachment=True, download_name='pdf-pages.zip')
+    
     except subprocess.TimeoutExpired:
-        return 'Timeout: PDF too large', 500
+        return 'Timeout: PDF is too large or complex for this server. Please try a smaller file.', 500
     except Exception as e:
         print(f'❌ PDF to JPG error: {e}', flush=True)
         return f'Error: {str(e)}', 500
@@ -503,7 +514,7 @@ def pdf_to_word():
         output_path = os.path.join(temp_dir, 'output.docx')
         txt_path = os.path.join(temp_dir, 'extracted.txt')
         file.save(input_path)
-        subprocess.run(['gs', '-sDEVICE=txtwrite', '-dNOPAUSE', '-dBATCH', '-dQUIET', f'-sOutputFile={txt_path}', input_path], check=True, timeout=PROCESSING_TIMEOUT, capture_output=True)
+        subprocess.run(['gs', '-sDEVICE=txtwrite', '-dNOPAUSE', '-dBATCH', '-dQUIET', '-dMaxBitmap=500000000', f'-sOutputFile={txt_path}', input_path], check=True, timeout=PROCESSING_TIMEOUT, capture_output=True)
         if not os.path.exists(txt_path):
             return 'Text extraction failed', 500
         with open(txt_path, 'r', encoding='utf-8', errors='ignore') as f:
@@ -719,7 +730,7 @@ def pdf_to_excel():
         txt_path = os.path.join(temp_dir, 'extracted.txt')
         output_path = os.path.join(temp_dir, 'output.xlsx')
         file.save(input_path)
-        subprocess.run(['gs', '-sDEVICE=txtwrite', '-dNOPAUSE', '-dBATCH', '-dQUIET', f'-sOutputFile={txt_path}', input_path], check=True, timeout=PROCESSING_TIMEOUT, capture_output=True)
+        subprocess.run(['gs', '-sDEVICE=txtwrite', '-dNOPAUSE', '-dBATCH', '-dQUIET', '-dMaxBitmap=500000000', f'-sOutputFile={txt_path}', input_path], check=True, timeout=PROCESSING_TIMEOUT, capture_output=True)
         if not os.path.exists(txt_path): return 'Text extraction failed', 500
         with open(txt_path, 'r', encoding='utf-8', errors='ignore') as f: text = f.read()
         if not text.strip(): return 'No text found in PDF', 400
@@ -813,7 +824,7 @@ def merge_pdf():
             path = os.path.join(temp_dir, f'input-{i:03d}.pdf')
             file.save(path); pdf_paths.append(path)
         output_path = os.path.join(temp_dir, 'merged.pdf')
-        cmd = ['gs', '-sDEVICE=pdfwrite', '-dNOPAUSE', '-dBATCH', '-dQUIET', '-dCompatibilityLevel=1.4', f'-sOutputFile={output_path}'] + pdf_paths
+        cmd = ['gs', '-sDEVICE=pdfwrite', '-dNOPAUSE', '-dBATCH', '-dQUIET', '-dCompatibilityLevel=1.4', '-dMaxBitmap=500000000', f'-sOutputFile={output_path}'] + pdf_paths
         subprocess.run(cmd, check=True, timeout=PROCESSING_TIMEOUT, capture_output=True)
         if not os.path.exists(output_path): return 'Merge failed', 500
         return send_file(output_path, mimetype='application/pdf', as_attachment=True, download_name='merged.pdf')
