@@ -79,8 +79,8 @@ HTML = '''
 <body>
     <div class="container">
         <h1>⚡ Bharat24Tools API v9.9</h1>
-        <p class="status-badge">Server is running ✅ — 23 Tools Active (1 Client-side)</p>
-        <div class="section-title">📄 PDF Tools (12)</div>
+        <p class="status-badge">Server is running ✅ — 22 Tools Active (2 Client-side)</p>
+        <div class="section-title">📄 PDF Tools (11)</div>
         <div class="endpoint"><code>POST /compress</code><span class="desc">Compress PDF ✅ AI Scanner Mode (10KB Min)</span></div>
         <div class="endpoint"><code>POST /pdf-to-jpg</code><span class="desc">PDF to Images</span></div>
         <div class="endpoint"><code>POST /jpg-to-pdf</code><span class="desc">Images to PDF</span></div>
@@ -91,7 +91,6 @@ HTML = '''
         <div class="endpoint"><code>POST /excel-to-image</code><span class="desc">Excel to Image</span></div>
         <div class="endpoint"><code>POST /merge-pdf</code><span class="desc">Merge PDFs</span></div>
         <div class="endpoint"><code>POST /split-pdf</code><span class="desc">Split PDF ✅ Advanced Visual Mode</span></div>
-        <div class="endpoint"><code>POST /rotate-pdf</code><span class="desc">Rotate PDF</span></div>
         <div class="endpoint"><code>POST /protect-pdf</code><span class="desc">Protect PDF</span></div>
         <div class="endpoint"><code>POST /unlock-pdf</code><span class="desc">Unlock PDF</span></div>
         <div class="section-title">🖼 Image Tools (11)</div>
@@ -104,7 +103,7 @@ HTML = '''
         <div class="endpoint"><code>POST /image-to-word</code><span class="desc">Image to Word ✅ AI + Fallback</span></div>
         <div class="endpoint"><code>POST /image-to-excel</code><span class="desc">Image to Excel ✅ AI + Fallback</span></div>
         <div class="endpoint"><code>POST /pdf-watermark</code><span class="desc">PDF Watermark</span></div>
-        <p class="footer">Version 9.9 — 23 Tools | AI Scanner Compression</p>
+        <p class="footer">Version 9.9 — 22 Tools | AI Scanner Compression</p>
     </div>
 </body>
 </html>
@@ -177,7 +176,7 @@ def health():
         'status': 'ok',
         'service': 'bharat24tools-api',
         'version': '9.9',
-        'tools': 23,
+        'tools': 22,
         'ocr_engine': 'gemini-3.8-flash (with fallback)',
         'sdk': 'google-genai',
         'gemini_configured': bool(os.environ.get('GEMINI_API_KEY', '').strip()),
@@ -930,42 +929,6 @@ def split_pdf():
     except Exception as e:
         import traceback
         traceback.print_exc()
-        return f'Error: {str(e)}', 500
-    finally:
-        processing_lock.release()
-        cleanup_dir(temp_dir)
-
-# ========== 11. ROTATE PDF ==========
-@app.route('/rotate-pdf', methods=['POST'])
-def rotate_pdf():
-    if not processing_lock.acquire(timeout=300):
-        return 'Server busy. Try again.', 503
-    temp_dir = tempfile.mkdtemp()
-    try:
-        if 'file' not in request.files:
-            return 'No file uploaded', 400
-        file = request.files['file']
-        valid, msg = validate_file(file, allowed_ext=['.pdf'])
-        if not valid: return msg, 400
-        angle = request.form.get('angle', '90')
-        try:
-            angle = int(angle)
-            if angle not in [90, 180, 270]: angle = 90
-        except: angle = 90
-        input_path = os.path.join(temp_dir, 'input.pdf')
-        output_path = os.path.join(temp_dir, 'rotated.pdf')
-        file.save(input_path)
-        try:
-            result = subprocess.run(['qpdf', '--show-npages', input_path], capture_output=True, text=True, timeout=30)
-            total_pages = int(result.stdout.strip())
-        except: total_pages = 0
-        if total_pages == 0: return 'Cannot read PDF page count', 400
-        rotate_spec = f'+{angle}:1-{total_pages}'
-        subprocess.run(['qpdf', f'--rotate={rotate_spec}', input_path, output_path], check=True, timeout=PROCESSING_TIMEOUT, capture_output=True)
-        if not os.path.exists(output_path): return 'Rotation failed', 500
-        return send_file(output_path, mimetype='application/pdf', as_attachment=True, download_name='rotated.pdf')
-    except Exception as e:
-        print(f'❌ Rotate error: {e}', flush=True)
         return f'Error: {str(e)}', 500
     finally:
         processing_lock.release()
