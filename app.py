@@ -1,4 +1,4 @@
-from flask import Flask, request, send_file, render_template_string, jsonify
+from flask import Flask, request, send_file, render_template_string
 from flask_cors import CORS
 import os
 import subprocess
@@ -63,7 +63,7 @@ HTML = '''
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Bharat24Tools API v10.0</title>
+    <title>Bharat24Tools API v10.1</title>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <style>
         * { margin:0; padding:0; box-sizing:border-box; font-family:Arial,sans-serif; }
@@ -80,11 +80,8 @@ HTML = '''
 </head>
 <body>
     <div class="container">
-        <h1>⚡ Bharat24Tools API v10.0</h1>
-        <p class="status-badge">Server is running ✅ — AI Chat Enabled</p>
-        
-        <div class="section-title">🤖 AI Tools (1)</div>
-        <div class="endpoint"><code>POST /chat-pdf</code><span class="desc">Chat with PDF (Gemini AI)</span></div>
+        <h1>⚡ Bharat24Tools API v10.1</h1>
+        <p class="status-badge">Server is running ✅ — All Tools Active</p>
         
         <div class="section-title">📄 PDF Tools (11)</div>
         <div class="endpoint"><code>POST /compress</code><span class="desc">Compress PDF ✅ AI Scanner Mode (10KB Min)</span></div>
@@ -110,7 +107,7 @@ HTML = '''
         <div class="endpoint"><code>POST /gif-maker</code><span class="desc">GIF Maker</span></div>
         <div class="endpoint"><code>POST /image-to-word</code><span class="desc">Image to Word ✅ AI + Fallback</span></div>
         <div class="endpoint"><code>POST /image-to-excel</code><span class="desc">Image to Excel ✅ AI + Fallback</span></div>
-        <p class="footer">Version 10.0 — 23 Tools | AI Chat Enabled</p>
+        <p class="footer">Version 10.1 — 22 Tools | API Server</p>
     </div>
 </body>
 </html>
@@ -182,9 +179,8 @@ def health():
     return {
         'status': 'ok',
         'service': 'bharat24tools-api',
-        'version': '10.0',
-        'tools': 23,
-        'ai_chat': True,
+        'version': '10.1',
+        'tools': 22,
         'ocr_engine': 'gemini-3.8-flash (with fallback)',
         'sdk': 'google-genai',
         'gemini_configured': bool(os.environ.get('GEMINI_API_KEY', '').strip()),
@@ -195,67 +191,6 @@ def health():
         'sketch_styles': ['pencil', 'charcoal', 'ink', 'colored', 'edge', 'crosshatch'],
         'sketch_formats': ['png', 'jpg', 'webp']
     }
-
-# ========== 0. AI CHAT WITH PDF ==========
-@app.route('/chat-pdf', methods=['POST'])
-def chat_pdf():
-    if 'file' not in request.files:
-        return jsonify({'error': 'No file uploaded'}), 400
-    
-    file = request.files['file']
-    user_query = request.form.get('query', 'Summarize this document.')
-    
-    if file.filename == '' or not file.filename.lower().endswith('.pdf'):
-        return jsonify({'error': 'Please upload a valid PDF'}), 400
-
-    try:
-        # 1. Extract Text
-        pdf_reader = PyPDF2.PdfReader(file)
-        extracted_text = ""
-        max_pages = min(len(pdf_reader.pages), 10) 
-        for i in range(max_pages):
-            page = pdf_reader.pages[i]
-            text = page.extract_text()
-            if text:
-                extracted_text += text + "\n"
-        
-        if not extracted_text.strip():
-            return jsonify({'error': 'Could not extract text. This might be a scanned PDF image.'}), 400
-
-        if len(extracted_text) > 30000:
-            extracted_text = extracted_text[:30000] + "\n...[Content Truncated]"
-
-        # 2. Check API Key
-        api_key = os.environ.get('GEMINI_API_KEY', '').strip()
-        if not api_key:
-            return jsonify({'error': 'AI Server not configured. Missing API Key.'}), 500
-
-        # 3. Call AI
-        client = genai.Client(api_key=api_key)
-        
-        prompt = f"""
-        You are an expert AI PDF Assistant. Answer the user's question based ONLY on the text provided below.
-        If the answer is not in the text, say "I couldn't find that information in the document."
-        Be helpful, concise, and format your answer neatly using bullet points if necessary.
-
-        --- PDF TEXT START ---
-        {extracted_text}
-        --- PDF TEXT END ---
-
-        User Question: {user_query}
-        """
-
-        response = client.models.generate_content(
-            model='gemini-1.5-flash', 
-            contents=prompt
-        )
-        
-        return jsonify({'reply': response.text})
-
-    except Exception as e:
-        print(f"AI Error: {e}")
-        return jsonify({'error': f'AI Processing failed: {str(e)}'}), 500
-
 
 # ========== 1. COMPRESS PDF (ADVANCED AI SCANNER MODE) ==========
 @app.route('/compress', methods=['POST'])
