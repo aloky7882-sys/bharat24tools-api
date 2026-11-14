@@ -589,7 +589,1157 @@ def word_to_pdf():
         processing_lock.release()
         cleanup_dir(temp_dir)
 
+# ======================================================================
+#  EXCEL -> PDF ENGINE  (BharatOS-Tools)
+#  Draws every sheet exactly as laid out in Excel: real column widths,
+#  row heights, merged cells, fills, borders, fonts, number formats.
+#  Nothing is truncated: long text wraps or overflows, wide sheets are
+#  scaled to fit the page (or split across pages), tall sheets continue
+#  on the next page with the header row repeated.
+# ======================================================================
+import os as _os
+import re as _re
+import glob as _glob
+import math as _math
+import colorsys as _colorsys
+import datetime as _dt
+from decimal import Decimal as _Dec, ROUND_HALF_UP as _HALF_UP, InvalidOperation as _InvOp
+from xml.etree import ElementTree as _ET
+
+from reportlab.pdfgen import canvas as _rl_canvas
+from reportlab.lib.pagesizes import A4 as _A4, A3 as _A3, LETTER as _LETTER, LEGAL as _LEGAL
+from reportlab.lib.colors import HexColor as _HexColor
+from reportlab.pdfbase import pdfmetrics as _pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont as _TTFont
+
+_PAGE_SIZES = {'A4': _A4, 'A3': _A3, 'LETTER': _LETTER, 'LEGAL': _LEGAL}
+_HERE = _os.path.dirname(_os.path.abspath(__file__))
+
+# ---------------------------------------------------------------- fonts
+_FALLBACK_FONTS = []          # [(registered_name, charToGlyph dict)]
+_FONTS_READY = False
+
+def _init_fonts():
+    """Find extra TTF fonts (Hindi/Unicode symbols) once. Put .ttf files in a
+    'fonts' folder next to app.py to add your own (e.g. NotoSansDevanagari)."""
+    global _FONTS_READY
+    if _FONTS_READY:
+        return
+    _FONTS_READY = True
+    patterns = [
+        _os.path.join(_HERE, 'fonts', '*.ttf'),
+        '/usr/share/fonts/**/NotoSansDevanagari-Regular.ttf',
+        '/usr/share/fonts/**/NotoSans-Regular.ttf',
+        '/usr/share/fonts/**/Lohit-Devanagari.ttf',
+        '/usr/share/fonts/**/FreeSans.ttf',
+        '/usr/share/fonts/**/DejaVuSans.ttf',
+        '/usr/share/fonts/**/LiberationSans-Regular.ttf',
+        'C:/Windows/Fonts/Nirmala.ttf', 'C:/Windows/Fonts/mangal.ttf', 'C:/Windows/Fonts/arial.ttf',
+        '/System/Library/Fonts/Supplemental/Arial Unicode.ttf',
+    ]
+    seen = set()
+    for pat in patterns:
+        for path in sorted(_glob.glob(pat, recursive=True)):
+            if path in seen:
+                continue
+            seen.add(path)
+            try:
+                name = 'XLFB%d' % len(_FALLBACK_FONTS)
+                _pdfmetrics.registerFont(_TTFont(name, path))
+                cmap = _pdfmetrics.getFont(name).face.charToGlyph
+                _FALLBACK_FONTS.append((name, cmap, path))
+            except Exception:
+                continue
+
+_BASE = {(False, False): 'Helvetica', (True, False): 'Helvetica-Bold',
+         (False, True): 'Helvetica-Oblique', (True, True): 'Helvetica-BoldOblique'}
+_SEG_CACHE = {}
+
+def _segments(text, bold, italic):
+    """Split text into runs; each run uses a font that really has those glyphs."""
+    key = (text, bold, italic)
+    hit = _SEG_CACHE.get(key)
+    if hit is not None:
+        return hit
+    base = _BASE[(bool(bold), bool(italic))]
+    runs = []
+    for ch in text:
+        if ch in '\t\r\n\u00a0':
+            ch = ' '
+        font = None
+        try:
+            ch.encode('cp1252')
+            font = base
+        except UnicodeEncodeError:
+            for name, cmap, _p in _FALLBACK_FONTS:
+                if ord(ch) in cmap:
+                    font = name
+                    break
+        if font is None:
+            if ord(ch) < 32 or 0x200B <= ord(ch) <= 0x200F or ord(ch) == 0xFEFF:
+                continue            # invisible characters
+            ch, font = '?', base
+        if runs and runs[-1][0] == font:
+            runs[-1][1] += ch
+        else:
+            runs.append([font, ch])
+    out = [(f, s) for f, s in runs]
+    if len(_SEG_CACHE) > 20000:
+        _SEG_CACHE.clear()
+    _SEG_CACHE[key] = out
+    return out
+
+# ---- complex scripts (Hindi/Devanagari, Arabic ...) need real shaping.
+# reportlab cannot do that, so such lines are drawn as pictures by Pillow+Raqm.
+_COMPLEX_RE = _re.compile('[\u0900-\u0DFF\u0600-\u06FF\u0E00-\u0E7F]')
+_RAQM = None
+_PIL_FONTS = {}
+_IMG_CACHE = {}
+_K = 4          # picture resolution multiplier
+
+def _raqm_available():
+    global _RAQM
+    if _RAQM is None:
+        try:
+            from PIL import features
+            _RAQM = bool(features.check('raqm'))
+        except Exception:
+            _RAQM = False
+    return _RAQM
+
+def _complex_font_path(text):
+    chars = [ord(c) for c in text if _COMPLEX_RE.match(c)]
+    if not chars:
+        return None
+    for name, cmap, path in _FALLBACK_FONTS:
+        if all(o in cmap for o in chars):
+            return path
+    for name, cmap, path in _FALLBACK_FONTS:
+        if chars[0] in cmap:
+            return path
+    return None
+
+def _pil_font(path, px):
+    key = (path, px)
+    f = _PIL_FONTS.get(key)
+    if f is None:
+        from PIL import ImageFont
+        f = ImageFont.truetype(path, px, layout_engine=ImageFont.Layout.RAQM)
+        if len(_PIL_FONTS) > 200:
+            _PIL_FONTS.clear()
+        _PIL_FONTS[key] = f
+    return f
+
+def _use_complex(text):
+    return bool(_COMPLEX_RE.search(text)) and _raqm_available() and _complex_font_path(text) is not None
+
+def _text_width(text, bold, italic, size):
+    if _use_complex(text):
+        try:
+            return _pil_font(_complex_font_path(text), max(4, int(round(size * _K)))).getlength(text) / float(_K)
+        except Exception:
+            pass
+    return sum(_pdfmetrics.stringWidth(s, f, size) for f, s in _segments(text, bold, italic))
+
+def _draw_complex(cv, text, size, x, y, color):
+    from PIL import Image, ImageDraw
+    from reportlab.lib.utils import ImageReader
+    px = max(4, int(round(size * _K)))
+    key = (text, px, color)
+    hit = _IMG_CACHE.get(key)
+    if hit is None:
+        font = _pil_font(_complex_font_path(text), px)
+        w = int(font.getlength(text)) + 8
+        h = int(px * 1.7) + 4
+        base = int(px * 1.25)
+        im = Image.new('RGBA', (w, h), (255, 255, 255, 0))
+        c = (color or '000000')
+        ImageDraw.Draw(im).text((4, base), text, font=font, fill=(int(c[0:2], 16), int(c[2:4], 16), int(c[4:6], 16), 255), anchor='ls')
+        hit = (ImageReader(im), w, h, base)
+        if len(_IMG_CACHE) > 3000:
+            _IMG_CACHE.clear()
+        _IMG_CACHE[key] = hit
+    reader, w, h, base = hit
+    cv.drawImage(reader, x - 4.0 / _K, y - (h - base) / float(_K), width=w / float(_K), height=h / float(_K), mask='auto')
+    return (w - 8) / float(_K)
+
+# --------------------------------------------------------------- colours
+_DEFAULT_THEME = ['FFFFFF', '000000', 'E7E6E6', '44546A', '4472C4', 'ED7D31', 'A5A5A5', 'FFC000', '5B9BD5', '70AD47']
+
+def _theme_palette(wb):
+    pal = list(_DEFAULT_THEME)
+    try:
+        raw = getattr(wb, 'loaded_theme', None)
+        if not raw:
+            return pal
+        root = _ET.fromstring(raw)
+        ns = {'a': 'http://schemas.openxmlformats.org/drawingml/2006/main'}
+        scheme = root.find('.//a:clrScheme', ns)
+        names = ['dk1', 'lt1', 'dk2', 'lt2', 'accent1', 'accent2', 'accent3', 'accent4', 'accent5', 'accent6']
+        found = {}
+        for n in names:
+            el = scheme.find('a:' + n, ns)
+            if el is None or len(el) == 0:
+                continue
+            ch = el[0]
+            val = ch.get('lastClr') or ch.get('val')
+            if val and len(val) == 6:
+                found[n] = val.upper()
+        # Excel theme index order: lt1, dk1, lt2, dk2, accents
+        order = ['lt1', 'dk1', 'lt2', 'dk2', 'accent1', 'accent2', 'accent3', 'accent4', 'accent5', 'accent6']
+        for i, n in enumerate(order):
+            if n in found:
+                pal[i] = found[n]
+    except Exception:
+        pass
+    return pal
+
+def _apply_tint(hex6, tint):
+    try:
+        if not tint:
+            return hex6
+        r, g, b = (int(hex6[i:i + 2], 16) / 255.0 for i in (0, 2, 4))
+        h, l, s = _colorsys.rgb_to_hls(r, g, b)
+        l = l * (1 + tint) if tint < 0 else l * (1 - tint) + tint
+        r, g, b = _colorsys.hls_to_rgb(h, max(0, min(1, l)), s)
+        return '%02X%02X%02X' % (round(r * 255), round(g * 255), round(b * 255))
+    except Exception:
+        return hex6
+
+def _color_hex(color, theme, default=None):
+    """openpyxl Color -> 'RRGGBB' or default."""
+    if color is None:
+        return default
+    try:
+        ctype = color.type
+        if ctype == 'rgb':
+            v = color.rgb
+            if isinstance(v, str) and len(v) in (6, 8):
+                return v[-6:].upper()
+        elif ctype == 'theme':
+            idx = int(color.theme)
+            if 0 <= idx < len(theme):
+                return _apply_tint(theme[idx], color.tint or 0)
+        elif ctype == 'indexed':
+            from openpyxl.styles.colors import COLOR_INDEX
+            idx = int(color.indexed)
+            if 0 <= idx < len(COLOR_INDEX):
+                v = COLOR_INDEX[idx]
+                if isinstance(v, str) and len(v) == 8:
+                    return v[-6:].upper()
+            if idx in (64, 65):
+                return default
+    except Exception:
+        pass
+    return default
+
+# ------------------------------------------------------- number formats
+_MONTHS = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August',
+           'September', 'October', 'November', 'December']
+_DAYS = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
+
+def _split_sections(fmt):
+    out, cur, q, br, i = [], '', False, False, 0
+    while i < len(fmt):
+        ch = fmt[i]
+        if ch == '\\' and i + 1 < len(fmt):
+            cur += fmt[i:i + 2]; i += 2; continue
+        if ch == '"':
+            q = not q
+        elif ch == '[' and not q:
+            br = True
+        elif ch == ']' and not q:
+            br = False
+        if ch == ';' and not q and not br:
+            out.append(cur); cur = ''
+        else:
+            cur += ch
+        i += 1
+    out.append(cur)
+    return out
+
+def _clean_brackets(sec):
+    """Remove [Red], [>100] etc.; turn [$₹-4009] into the currency symbol."""
+    def repl(m):
+        inner = m.group(1)
+        if inner.startswith('$'):
+            sym = inner[1:].split('-')[0]
+            return '"' + sym + '"' if sym else ''
+        return ''
+    return _re.sub(r'\[([^\]]*)\]', lambda m: m.group(0) if _re.fullmatch(r'h+|m+|s+', m.group(1), _re.I) else repl(m), sec)
+
+def _general_number(v):
+    if isinstance(v, int) or (isinstance(v, float) and v == int(v) and abs(v) < 1e11):
+        return str(int(v))
+    s = '%.10g' % v
+    if 'e' in s:
+        mant, exp = s.split('e')
+        s = mant + 'E' + exp[0] + exp[1:].lstrip('0').rjust(2, '0')
+    return s
+
+def _group3(int_str):
+    out = ''
+    while len(int_str) > 3:
+        out = ',' + int_str[-3:] + out
+        int_str = int_str[:-3]
+    return int_str + out
+
+def _format_number(v, fmt):
+    if not fmt or fmt.strip().lower() == 'general':
+        return _general_number(v)
+    secs = _split_sections(fmt)
+    neg = v < 0
+    minus = False
+    if neg and len(secs) >= 2:
+        sec, val = secs[1], -v
+    elif v == 0 and len(secs) >= 3:
+        sec, val = secs[2], v
+    else:
+        sec, val = secs[0], abs(v)
+        minus = neg
+    sec = _clean_brackets(sec)
+    # tokenise into literals and numeric placeholders
+    prefix, core, suffix, state = '', '', '', 0      # state 0=before digits 1=in digits 2=after
+    percent = 0
+    i = 0
+    def add_lit(t):
+        nonlocal prefix, suffix, core, state
+        if state == 0:
+            prefix += t
+        else:
+            state = 2
+            suffix += t
+    while i < len(sec):
+        ch = sec[i]
+        if ch == '"':
+            j = sec.find('"', i + 1)
+            j = len(sec) if j < 0 else j
+            add_lit(sec[i + 1:j]); i = j + 1; continue
+        if ch == '\\' and i + 1 < len(sec):
+            add_lit(sec[i + 1]); i += 2; continue
+        if ch == '_' and i + 1 < len(sec):
+            add_lit(' '); i += 2; continue
+        if ch == '*' and i + 1 < len(sec):
+            i += 2; continue
+        if ch == '%':
+            percent += 1; add_lit('%'); i += 1; continue
+        if ch in '0#?' or (ch in '.,' and state != 2 and (state == 1 or (i + 1 < len(sec) and sec[i + 1] in '0#?'))):
+            if state == 2:
+                add_lit(ch); i += 1; continue
+            state = 1; core += ch; i += 1; continue
+        if ch in 'Ee' and state == 1 and i + 1 < len(sec) and sec[i + 1] in '+-':
+            core += sec[i:i + 2]; i += 2; continue
+        if ch == '@':
+            i += 1; continue
+        add_lit(ch); i += 1
+    if not core:
+        return ('-' if minus else '') + prefix + suffix if (prefix or suffix) and not core else _general_number(v)
+    if percent:
+        val = val * (100 ** percent)
+    # scientific
+    if _re.search(r'[Ee][+-]', core):
+        mant = core.split('E')[0].split('e')[0]
+        dec = len(mant.split('.')[1].replace(',', '')) if '.' in mant else 0
+        txt = format(val, '.%dE' % dec)
+        return ('-' if minus else '') + prefix + txt + suffix
+    int_pat, _, dec_pat = core.partition('.')
+    thousands = ',' in int_pat
+    trailing = len(int_pat) - len(int_pat.rstrip(','))
+    if trailing:
+        val = val / (1000 ** trailing)
+    int_digits = _re.sub(r'[^0#?]', '', int_pat)
+    dec_digits = _re.sub(r'[^0#?]', '', dec_pat)
+    decimals = len(dec_digits)
+    try:
+        q = _Dec(repr(float(val))).quantize(_Dec(1).scaleb(-decimals), rounding=_HALF_UP)
+    except (_InvOp, ValueError):
+        return _general_number(v)
+    txt = format(q, 'f')
+    ip, _, dp = txt.partition('.')
+    min_int = int_digits.count('0')
+    ip = ip.lstrip('0')
+    ip = ip.rjust(min_int, '0')
+    if thousands:
+        ip = _group3(ip)
+    # optional decimals ('#') lose trailing zeros
+    opt = len(dec_digits) - len(dec_digits.rstrip('#'))
+    while opt and dp.endswith('0'):
+        dp = dp[:-1]; opt -= 1
+    res = ip + ('.' + dp if dp else '')
+    if not ip and not dp and not (prefix or suffix):
+        res = ''
+    if minus and (ip or dp):
+        res = '-' + prefix + res + suffix
+    else:
+        res = prefix + res + suffix
+    return res
+
+def _date_tokens(sec):
+    toks, i = [], 0
+    pat = _re.compile(r'(yyyy|yy|mmmmm|mmmm|mmm|mm|m|dddd|ddd|dd|d|hh|h|ss|s|AM/PM|am/pm|A/P|a/p)', _re.I)
+    while i < len(sec):
+        ch = sec[i]
+        if ch == '"':
+            j = sec.find('"', i + 1); j = len(sec) if j < 0 else j
+            toks.append(('lit', sec[i + 1:j])); i = j + 1; continue
+        if ch == '\\' and i + 1 < len(sec):
+            toks.append(('lit', sec[i + 1])); i += 2; continue
+        if ch == '_' and i + 1 < len(sec):
+            toks.append(('lit', ' ')); i += 2; continue
+        if ch == '*' and i + 1 < len(sec):
+            i += 2; continue
+        if ch == '[':
+            j = sec.find(']', i)
+            j = len(sec) - 1 if j < 0 else j
+            inner = sec[i + 1:j]
+            if _re.fullmatch(r'h+|m+|s+', inner, _re.I):
+                toks.append(('elapsed', inner.lower()))
+            i = j + 1; continue
+        m = pat.match(sec, i)
+        if m:
+            toks.append(('tok', m.group(1))); i = m.end(); continue
+        if ch == '.' and i + 1 < len(sec) and sec[i + 1] == '0':
+            j = i + 1
+            while j < len(sec) and sec[j] == '0':
+                j += 1
+            toks.append(('frac', j - i - 1)); i = j; continue
+        toks.append(('lit', ch)); i += 1
+    return toks
+
+def _format_date(v, fmt):
+    if isinstance(v, _dt.timedelta):
+        total = int(v.total_seconds())
+        sign = '-' if total < 0 else ''
+        total = abs(total)
+        return '%s%d:%02d:%02d' % (sign, total // 3600, (total % 3600) // 60, total % 60)
+    if isinstance(v, _dt.time):
+        dtv = _dt.datetime(1900, 1, 1, v.hour, v.minute, v.second, v.microsecond)
+    elif isinstance(v, _dt.datetime):
+        dtv = v
+    else:
+        dtv = _dt.datetime(v.year, v.month, v.day)
+    if not fmt or fmt.strip().lower() == 'general' or not _re.search(r'[ymdhs]', _re.sub(r'"[^"]*"|\[[^\]]*\]|\\.', '', fmt), _re.I):
+        if isinstance(v, _dt.time):
+            return dtv.strftime('%H:%M:%S')
+        s = dtv.strftime('%d-%m-%Y')
+        if dtv.hour or dtv.minute or dtv.second:
+            s += dtv.strftime(' %H:%M')
+        return s
+    sec = _clean_brackets(_split_sections(fmt)[0])
+    toks = _date_tokens(sec)
+    has_ampm = any(k == 'tok' and t.upper() in ('AM/PM', 'A/P') for k, t in toks)
+    # decide whether each 'm' is month or minute
+    kinds = [(k, t.lower() if k == 'tok' else t) for k, t in toks]
+    for idx, (k, t) in enumerate(kinds):
+        if k == 'tok' and t in ('m', 'mm'):
+            prev = next((kinds[j][1] for j in range(idx - 1, -1, -1) if kinds[j][0] in ('tok', 'elapsed')), None)
+            nxt = next((kinds[j][1] for j in range(idx + 1, len(kinds)) if kinds[j][0] in ('tok', 'elapsed')), None)
+            if (prev in ('h', 'hh', 'h', 'hh')) or (nxt in ('s', 'ss')):
+                kinds[idx] = ('min', t)
+    out = ''
+    for (k, t), (_, orig) in zip(kinds, toks):
+        if k == 'lit':
+            out += t
+        elif k == 'elapsed':
+            total = dtv.hour * 3600 + dtv.minute * 60 + dtv.second
+            out += str(total // 3600) if t[0] == 'h' else (str(total // 60) if t[0] == 'm' else str(total))
+        elif k == 'frac':
+            out += ('%06d' % dtv.microsecond)[:t]
+        elif k == 'min':
+            out += ('%02d' if t == 'mm' else '%d') % dtv.minute
+        else:
+            if t == 'yyyy': out += '%04d' % dtv.year
+            elif t == 'yy': out += '%02d' % (dtv.year % 100)
+            elif t == 'mmmmm': out += _MONTHS[dtv.month - 1][0]
+            elif t == 'mmmm': out += _MONTHS[dtv.month - 1]
+            elif t == 'mmm': out += _MONTHS[dtv.month - 1][:3]
+            elif t == 'mm': out += '%02d' % dtv.month
+            elif t == 'm': out += str(dtv.month)
+            elif t == 'dddd': out += _DAYS[dtv.weekday()]
+            elif t == 'ddd': out += _DAYS[dtv.weekday()][:3]
+            elif t == 'dd': out += '%02d' % dtv.day
+            elif t == 'd': out += str(dtv.day)
+            elif t in ('hh', 'h'):
+                hh = dtv.hour
+                if has_ampm:
+                    hh = hh % 12 or 12
+                out += ('%02d' if t == 'hh' else '%d') % hh
+            elif t == 'ss': out += '%02d' % dtv.second
+            elif t == 's': out += str(dtv.second)
+            elif t in ('am/pm', 'a/p'):
+                am = dtv.hour < 12
+                if t == 'am/pm':
+                    out += ('AM' if am else 'PM') if orig.isupper() else ('am' if am else 'pm')
+                else:
+                    out += ('A' if am else 'P') if orig.isupper() else ('a' if am else 'p')
+    return out
+
+def _display_text(value, fmt):
+    if value is None:
+        return '', 's'
+    if isinstance(value, bool):
+        return ('TRUE' if value else 'FALSE'), 'b'
+    if isinstance(value, (_dt.datetime, _dt.date, _dt.time, _dt.timedelta)):
+        return _format_date(value, fmt), 'd'
+    if isinstance(value, (int, float, _Dec)):
+        try:
+            f = float(value)
+            if f != f or f in (float('inf'), float('-inf')):
+                return str(value), 's'
+            return _format_number(value if not isinstance(value, _Dec) else f, fmt), 'n'
+        except Exception:
+            return str(value), 'n'
+    s = str(value)
+    return s, 's'
+
+# ------------------------------------------------------------ sheet model
+class _Cell(object):
+    __slots__ = ('text', 'kind', 'bold', 'italic', 'underline', 'strike', 'size', 'color', 'fill',
+                 'halign', 'valign', 'wrap', 'indent', 'borders')
+
+_BORDER_W = {'hair': 0.25, 'thin': 0.5, 'dashed': 0.5, 'dotted': 0.5, 'dashDot': 0.5, 'dashDotDot': 0.5,
+             'mediumDashed': 1.0, 'mediumDashDot': 1.0, 'mediumDashDotDot': 1.0, 'slantDashDot': 1.0,
+             'medium': 1.0, 'double': 1.2, 'thick': 1.8}
+_BORDER_DASH = {'dashed': (3, 2), 'mediumDashed': (4, 2), 'dotted': (1, 1.2), 'dashDot': (3, 1.5, 1, 1.5),
+                'dashDotDot': (3, 1.5, 1, 1.5, 1, 1.5), 'hair': (1, 1)}
+
+def _read_cell(cell, theme):
+    c = _Cell()
+    fmt = cell.number_format
+    c.text, c.kind = _display_text(cell.value, fmt)
+    f = cell.font
+    c.bold = bool(f.b) if f is not None else False
+    c.italic = bool(f.i) if f is not None else False
+    c.underline = bool(f is not None and f.u and f.u != 'none')
+    c.strike = bool(f is not None and f.strike)
+    try:
+        c.size = float(f.sz) if f is not None and f.sz else 11.0
+    except Exception:
+        c.size = 11.0
+    c.color = _color_hex(f.color, theme, None) if f is not None else None
+    fill = None
+    try:
+        fl = cell.fill
+        if fl is not None and fl.fill_type == 'solid':
+            fill = _color_hex(fl.fgColor, theme, None)
+            if fill is not None and fill.upper() == 'FFFFFF':
+                fill = None
+    except Exception:
+        fill = None
+    c.fill = fill
+    al = cell.alignment
+    c.halign = (al.horizontal or 'general') if al is not None else 'general'
+    c.valign = (al.vertical or 'bottom') if al is not None else 'bottom'
+    c.wrap = bool(al.wrap_text) if al is not None else False
+    c.indent = float(al.indent or 0) if al is not None else 0
+    b = {}
+    try:
+        bd = cell.border
+        for side in ('left', 'right', 'top', 'bottom'):
+            sd = getattr(bd, side, None)
+            if sd is not None and sd.style:
+                b[side] = (_BORDER_W.get(sd.style, 0.5), _color_hex(sd.color, theme, '000000'), sd.style)
+    except Exception:
+        pass
+    c.borders = b
+    return c
+
+class _Sheet(object):
+    pass
+
+def _load_sheet(ws, theme):
+    cells_raw = getattr(ws, '_cells', None)
+    if cells_raw is None:
+        return None
+    # --- find real extents (ignore huge empty formatted areas)
+    items, min_r, max_r, min_c, max_c = [], None, 0, None, 0
+    for (r, c), cell in list(cells_raw.items()):
+        try:
+            has_val = cell.value is not None and not (isinstance(cell.value, str) and not cell.value.strip())
+            vis = False
+            if not has_val:
+                try:
+                    fl = cell.fill
+                    if fl is not None and fl.fill_type == 'solid':
+                        col = _color_hex(fl.fgColor, theme, None)
+                        vis = col is not None and col.upper() != 'FFFFFF'
+                except Exception:
+                    pass
+                if not vis:
+                    try:
+                        bd = cell.border
+                        vis = any(getattr(getattr(bd, s, None), 'style', None) for s in ('left', 'right', 'top', 'bottom'))
+                    except Exception:
+                        pass
+            if has_val or vis:
+                items.append((r, c, cell))
+                min_r = r if min_r is None else min(min_r, r)
+                min_c = c if min_c is None else min(min_c, c)
+                max_r, max_c = max(max_r, r), max(max_c, c)
+        except Exception:
+            continue
+    merges = []
+    try:
+        for rng in ws.merged_cells.ranges:
+            merges.append((rng.min_row, rng.min_col, rng.max_row, rng.max_col))
+            if rng.min_row < 100000 and rng.max_row <= max_r + 1000:
+                pass
+    except Exception:
+        pass
+    if not items:
+        return None
+    # merged areas can extend the used range only if their top-left is inside it
+    merges = [m for m in merges if m[0] <= max_r and m[1] <= max_c]
+    for (r1, c1, r2, c2) in merges:
+        max_r, max_c = max(max_r, min(r2, max_r + 50)), max(max_c, min(c2, max_c + 50))
+
+    sh = _Sheet()
+    sh.name = ws.title
+    sh.r0, sh.r1, sh.c0, sh.c1 = min_r, max_r, min_c, max_c
+    # --- column widths
+    fmt_pr = ws.sheet_format
+    base_w = fmt_pr.defaultColWidth or ((fmt_pr.baseColWidth or 8) + 0.43)
+    colw, colhidden = {}, set()
+    for key, cd in list(ws.column_dimensions.items()):
+        try:
+            lo = cd.min or 0
+            hi = cd.max or lo
+            if not lo:
+                from openpyxl.utils import column_index_from_string
+                lo = hi = column_index_from_string(key)
+            for ci in range(lo, min(hi, max_c) + 1):
+                if cd.hidden:
+                    colhidden.add(ci)
+                if cd.width is not None:
+                    colw[ci] = cd.width
+        except Exception:
+            continue
+    sh.cols = [c for c in range(min_c, max_c + 1) if c not in colhidden]
+    sh.colw = {c: max(2.0, ((colw.get(c, base_w) * 7 + 5) * 0.75)) for c in sh.cols}
+    # --- row heights
+    def_h = fmt_pr.defaultRowHeight or 15.0
+    rowh, rowhidden, custom = {}, set(), set()
+    for r, rd in list(ws.row_dimensions.items()):
+        if r < min_r or r > max_r:
+            continue
+        if rd.hidden:
+            rowhidden.add(r)
+        if rd.height is not None:
+            rowh[r] = float(rd.height)
+            custom.add(r)
+    sh.rows = [r for r in range(min_r, max_r + 1) if r not in rowhidden]
+    sh.def_h, sh.rowh, sh.custom = def_h, rowh, custom
+    # --- cells
+    sh.cells = {}
+    for r, c, cell in items:
+        if r in rowhidden or c in colhidden:
+            continue
+        sh.cells[(r, c)] = _read_cell(cell, theme)
+    # merged cells also need style of their master even if it was filtered as 'empty'
+    sh.master, sh.covered = {}, set()
+    for (r1, c1, r2, c2) in merges:
+        sh.master[(r1, c1)] = (r1, c1, r2, c2)
+        for rr in range(r1, min(r2, max_r) + 1):
+            for cc in range(c1, min(c2, max_c) + 1):
+                if (rr, cc) != (r1, c1):
+                    sh.covered.add((rr, cc))
+        if (r1, c1) not in sh.cells:
+            try:
+                sh.cells[(r1, c1)] = _read_cell(ws.cell(row=r1, column=c1), theme)
+            except Exception:
+                pass
+        # borders/fills of a merged area are stored on its other cells too
+        try:
+            br = ws.cell(row=r1, column=c2)
+            bb = ws.cell(row=r2, column=c1)
+            m = sh.cells.get((r1, c1))
+            if m is not None:
+                if br.border is not None and br.border.right is not None and br.border.right.style:
+                    m.borders['right'] = (_BORDER_W.get(br.border.right.style, 0.5), _color_hex(br.border.right.color, theme, '000000'), br.border.right.style)
+                if bb.border is not None and bb.border.bottom is not None and bb.border.bottom.style:
+                    m.borders['bottom'] = (_BORDER_W.get(bb.border.bottom.style, 0.5), _color_hex(bb.border.bottom.color, theme, '000000'), bb.border.bottom.style)
+        except Exception:
+            pass
+    try:
+        sh.landscape_hint = (ws.page_setup.orientation == 'landscape')
+    except Exception:
+        sh.landscape_hint = False
+    return sh
+
+# ---------------------------------------------------------- text layout
+_PAD = 2.0
+
+def _wrap_lines(text, bold, italic, size, avail):
+    lines = []
+    for para in text.replace('\r\n', '\n').replace('\r', '\n').split('\n'):
+        words = para.split(' ')
+        cur = ''
+        for w in words:
+            trial = w if not cur else cur + ' ' + w
+            if _text_width(trial, bold, italic, size) <= avail:
+                cur = trial
+                continue
+            if cur:
+                lines.append(cur)
+                cur = ''
+            # a single word longer than the cell: break it by characters
+            if _text_width(w, bold, italic, size) <= avail:
+                cur = w
+            else:
+                piece = ''
+                for ch in w:
+                    if piece and _text_width(piece + ch, bold, italic, size) > avail:
+                        lines.append(piece)
+                        piece = ch
+                    else:
+                        piece += ch
+                cur = piece
+        lines.append(cur)
+    return lines
+
+def _auto_wrap(sh, smart):
+    """Excel clips text that does not fit when the next cell is filled. We never
+    want a cut line, so such text is wrapped (and its row grows) instead."""
+    if not smart:
+        return
+    for r in sh.rows:
+        for c in sh.cols:
+            cell = sh.cells.get((r, c))
+            if cell is None or cell.wrap or cell.kind != 's' or not cell.text.strip() or (r, c) in sh.covered:
+                continue
+            m = sh.master.get((r, c))
+            if m is not None and m[2] > m[0]:
+                continue
+            width = sum(sh.colw.get(cc, 0) for cc in range(c, (m[3] if m else c) + 1) if cc in sh.colw)
+            avail = width - 2 * _PAD - cell.indent * 6
+            text = cell.text.replace('\r', ' ').replace('\n', ' ')
+            tw = _text_width(text, cell.bold, cell.italic, cell.size)
+            if tw <= avail:
+                continue
+            halign = cell.halign
+            if halign in ('general', 'fill', 'distributed', 'justify'):
+                halign = 'left'
+            free_r = free_l = 0.0
+            if m is None:
+                pos = sh.cols.index(c)
+                if halign in ('left', 'center'):
+                    for nxt in sh.cols[pos + 1:]:
+                        nc = sh.cells.get((r, nxt))
+                        if (nc is not None and nc.text.strip()) or (r, nxt) in sh.covered or (r, nxt) in sh.master:
+                            break
+                        free_r += sh.colw[nxt]
+                if halign in ('right', 'center'):
+                    for prv in reversed(sh.cols[:pos]):
+                        nc = sh.cells.get((r, prv))
+                        if (nc is not None and nc.text.strip()) or (r, prv) in sh.covered or (r, prv) in sh.master:
+                            break
+                        free_l += sh.colw[prv]
+            room = avail + (min(free_l, free_r) * 2 if halign == 'center' else free_l + free_r)
+            if tw > room * 1.2:
+                cell.wrap = True
+
+def _row_heights(sh):
+    """Real height of every row; rows grow so wrapped text is never cut."""
+    heights = {}
+    for r in sh.rows:
+        base = sh.rowh.get(r)
+        max_sz = 0.0
+        need = 0.0
+        for c in sh.cols:
+            cell = sh.cells.get((r, c))
+            if cell is None or (r, c) in sh.covered:
+                continue
+            max_sz = max(max_sz, cell.size if cell.text else 0)
+            if cell.wrap and cell.text:
+                m = sh.master.get((r, c))
+                if m is not None and m[2] > m[0]:
+                    continue        # multi-row merge: keep the Excel height
+                width = sum(sh.colw.get(cc, 0) for cc in range(c, (m[3] if m else c) + 1) if cc in sh.colw)
+                lines = _wrap_lines(cell.text, cell.bold, cell.italic, cell.size, max(4.0, width - 2 * _PAD - cell.indent * 6))
+                need = max(need, len(lines) * cell.size * 1.2 + 4)
+        if base is None:
+            base = max(sh.def_h, max_sz * 1.36 if max_sz else 0)
+        heights[r] = max(base, need, 4.0)
+    return heights
+
+# ------------------------------------------------------------- pagination
+class _Page(object):
+    pass
+
+def _plan_sheet(sh, opts):
+    pw, ph = _PAGE_SIZES.get(opts['page_size'], _A4)
+    M = 24.0
+    foot = 20.0 if opts['footer'] else 8.0
+    total_w = sum(sh.colw[c] for c in sh.cols)
+    orient = opts['orientation']
+    if orient == 'auto':
+        if not opts['fit_width']:
+            orient = 'landscape' if (sh.landscape_hint or total_w > pw - 2 * M) else 'portrait'
+        else:
+            scale_p = min(1.0, (pw - 2 * M) / total_w)
+            orient = 'portrait' if (scale_p >= 0.75 and not sh.landscape_hint) or scale_p >= 0.999 else 'landscape'
+    if orient == 'landscape':
+        pw, ph = max(pw, ph), min(pw, ph)
+    else:
+        pw, ph = min(pw, ph), max(pw, ph)
+    usable_w = pw - 2 * M
+    usable_h = ph - M - M - foot
+    # ---- column bands
+    MIN_SCALE = 0.55
+    bands = []
+    if opts['fit_width'] and total_w * MIN_SCALE <= usable_w:
+        bands = [list(sh.cols)]
+    else:
+        cap = usable_w / 0.7 if opts['fit_width'] else usable_w
+        cur, cur_w = [], 0.0
+        for c in sh.cols:
+            w = sh.colw[c]
+            if cur and cur_w + w > cap:
+                bands.append(cur)
+                cur, cur_w = [], 0.0
+            cur.append(c)
+            cur_w += w
+        if cur:
+            bands.append(cur)
+    _auto_wrap(sh, opts.get('smart_wrap', True))
+    heights = _row_heights(sh)
+    # rows that must stay together (merged areas)
+    keep = set()
+    for (r1, c1, r2, c2) in sh.master.values():
+        for rr in range(r1, r2):
+            keep.add(rr)
+    pages = []
+    for band in bands:
+        band_w = sum(sh.colw[c] for c in band)
+        scale = min(1.0, usable_w / band_w) if (opts['fit_width'] or band_w > usable_w) else 1.0
+        scale = max(scale, 0.25)
+        header = sh.rows[0] if (opts['repeat_header'] and len(sh.rows) > 1) else None
+        hdr_h = heights[header] * scale if header is not None else 0.0
+        idx = 0
+        first = True
+        while idx < len(sh.rows):
+            page_rows, used = [], 0.0
+            if not first and header is not None:
+                page_rows.append(header)
+                used += hdr_h
+            start_len = len(page_rows)
+            while idx < len(sh.rows):
+                r = sh.rows[idx]
+                rh = heights[r] * scale
+                if page_rows and used + rh > usable_h and len(page_rows) > start_len:
+                    # never split a merged block: move the whole block to the next page
+                    j = len(page_rows) - 1
+                    while j > start_len and page_rows[j - 1] in keep:
+                        j -= 1
+                    if page_rows[-1] in keep and j > start_len:
+                        idx -= (len(page_rows) - j)
+                        page_rows = page_rows[:j]
+                    break
+                page_rows.append(r)
+                used += rh
+                idx += 1
+                if used > usable_h and len(page_rows) == start_len + 1:
+                    break       # a single very tall row: keep it, it will be clipped
+            if len(page_rows) == start_len:        # safety: avoid endless loop
+                page_rows.append(sh.rows[idx]); idx += 1
+            p = _Page()
+            p.sheet, p.rows, p.cols, p.scale = sh, page_rows, band, scale
+            p.pw, p.ph, p.heights = pw, ph, heights
+            pages.append(p)
+            first = False
+    return pages
+
+# ---------------------------------------------------------------- drawing
+def _hex(c, default='000000'):
+    return _HexColor('#' + (c or default))
+
+def _draw_text_line(cv, text, bold, italic, size, x, y, color, underline=False, strike=False):
+    cv.setFillColor(_hex(color))
+    cx = x
+    if _use_complex(text):
+        try:
+            cx = x + _draw_complex(cv, text, size, x, y, color)
+        except Exception:
+            cx = x
+            for font, seg in _segments(text, bold, italic):
+                cv.setFont(font, size); cv.drawString(cx, y, seg); cx += _pdfmetrics.stringWidth(seg, font, size)
+    else:
+        for font, seg in _segments(text, bold, italic):
+            cv.setFont(font, size)
+            cv.drawString(cx, y, seg)
+            cx += _pdfmetrics.stringWidth(seg, font, size)
+    if underline or strike:
+        w = cx - x
+        cv.setStrokeColor(_hex(color)); cv.setLineWidth(max(0.4, size * 0.05)); cv.setDash()
+        if underline:
+            cv.line(x, y - size * 0.12, x + w, y - size * 0.12)
+        if strike:
+            cv.line(x, y + size * 0.3, x + w, y + size * 0.3)
+
+def _draw_page(cv, pg, opts, page_no, total, brand):
+    sh, s = pg.sheet, pg.scale
+    cv.setPageSize((pg.pw, pg.ph))
+    M = 24.0
+    col_x, x = {}, M
+    for c in pg.cols:
+        col_x[c] = x
+        x += sh.colw[c] * s
+    row_y, y = {}, pg.ph - M
+    for r in pg.rows:
+        row_y[r] = y                       # top edge of the row
+        y -= pg.heights[r] * s
+    def col_w(c): return sh.colw[c] * s
+    def row_h(r): return pg.heights[r] * s
+    colset, rowset = set(pg.cols), set(pg.rows)
+    # ---------- pass 1: fills
+    for r in pg.rows:
+        for c in pg.cols:
+            if (r, c) in sh.covered:
+                continue
+            cell = sh.cells.get((r, c))
+            if cell is None or not cell.fill:
+                continue
+            w, h = col_w(c), row_h(r)
+            m = sh.master.get((r, c))
+            if m:
+                w = sum(col_w(cc) for cc in range(m[1], m[3] + 1) if cc in colset)
+                h = sum(row_h(rr) for rr in range(m[0], m[2] + 1) if rr in rowset)
+            cv.setFillColor(_hex(cell.fill))
+            cv.rect(col_x[c], row_y[r] - h, w, h, stroke=0, fill=1)
+    # ---------- pass 2: gridlines
+    if opts['gridlines']:
+        cv.setStrokeColor(_HexColor('#D4D4D8')); cv.setLineWidth(0.3); cv.setDash()
+        left, right = col_x[pg.cols[0]], col_x[pg.cols[-1]] + col_w(pg.cols[-1])
+        top, bottom = row_y[pg.rows[0]], row_y[pg.rows[-1]] - row_h(pg.rows[-1])
+        merged_inner = set()
+        for (r1, c1, r2, c2) in sh.master.values():
+            for rr in range(r1, r2 + 1):
+                for cc in range(c1, c2 + 1):
+                    merged_inner.add((rr, cc))
+        for r in pg.rows:
+            yy = row_y[r] - row_h(r)
+            cv.line(left, yy, right, yy)
+        cv.line(left, top, right, top)
+        for c in pg.cols:
+            cv.line(col_x[c], top, col_x[c], bottom)
+        cv.line(right, top, right, bottom)
+        # erase grid inside merged cells
+        cv.setFillColor(_HexColor('#FFFFFF'))
+        for (r1, c1, r2, c2) in sh.master.values():
+            if r1 in rowset and c1 in colset:
+                w = sum(col_w(cc) for cc in range(c1, c2 + 1) if cc in colset)
+                h = sum(row_h(rr) for rr in range(r1, r2 + 1) if rr in rowset)
+                cell = sh.cells.get((r1, c1))
+                cv.setFillColor(_hex(cell.fill) if cell is not None and cell.fill else _HexColor('#FFFFFF'))
+                cv.rect(col_x[c1] + 0.3, row_y[r1] - h + 0.3, w - 0.6, h - 0.6, stroke=0, fill=1)
+    # ---------- pass 3: explicit borders
+    for r in pg.rows:
+        for c in pg.cols:
+            if (r, c) in sh.covered:
+                continue
+            cell = sh.cells.get((r, c))
+            if cell is None or not cell.borders:
+                continue
+            w, h = col_w(c), row_h(r)
+            m = sh.master.get((r, c))
+            if m:
+                w = sum(col_w(cc) for cc in range(m[1], m[3] + 1) if cc in colset)
+                h = sum(row_h(rr) for rr in range(m[0], m[2] + 1) if rr in rowset)
+            x0, y1 = col_x[c], row_y[r]
+            y0 = y1 - h
+            for side, (bw, bc, bstyle) in cell.borders.items():
+                cv.setStrokeColor(_hex(bc)); cv.setLineWidth(max(0.25, bw * max(s, 0.6)))
+                dash = _BORDER_DASH.get(bstyle)
+                cv.setDash(*dash) if dash else cv.setDash()
+                if side == 'left': cv.line(x0, y0, x0, y1)
+                elif side == 'right': cv.line(x0 + w, y0, x0 + w, y1)
+                elif side == 'top': cv.line(x0, y1, x0 + w, y1)
+                elif side == 'bottom': cv.line(x0, y0, x0 + w, y0)
+    cv.setDash()
+    # ---------- pass 4: text
+    for r in pg.rows:
+        for c in pg.cols:
+            if (r, c) in sh.covered:
+                continue
+            cell = sh.cells.get((r, c))
+            if cell is None or not cell.text.strip():
+                continue
+            m = sh.master.get((r, c))
+            cw, ch_ = col_w(c), row_h(r)
+            if m:
+                cw = sum(col_w(cc) for cc in range(m[1], m[3] + 1) if cc in colset)
+                ch_ = sum(row_h(rr) for rr in range(m[0], m[2] + 1) if rr in rowset)
+            x0, ytop = col_x[c], row_y[r]
+            size = max(3.5, cell.size * s)
+            halign = cell.halign
+            if halign in ('general', 'fill', 'distributed', 'justify'):
+                halign = 'right' if cell.kind in ('n', 'd') else ('center' if cell.kind == 'b' else 'left')
+            pad = _PAD * max(s, 0.6)
+            ind = cell.indent * 6 * s
+            avail = cw - 2 * pad - ind
+            clip_x, clip_w = x0, cw
+            lines = None
+            if cell.wrap:
+                lines = _wrap_lines(cell.text, cell.bold, cell.italic, size, max(3.0, avail))
+            else:
+                text = cell.text.replace('\r', ' ').replace('\n', ' ')
+                tw = _text_width(text, cell.bold, cell.italic, size)
+                if tw > avail and not m:
+                    # let text flow into empty neighbouring cells like Excel does
+                    extra_r = extra_l = 0.0
+                    if halign in ('left', 'center') and cell.kind == 's':
+                        cc = c
+                        idxs = pg.cols
+                        pos = idxs.index(c)
+                        for nxt in idxs[pos + 1:]:
+                            nc = sh.cells.get((r, nxt))
+                            if (nc is not None and nc.text.strip()) or (r, nxt) in sh.covered or (r, nxt) in sh.master:
+                                break
+                            extra_r += col_w(nxt)
+                            if tw <= avail + extra_r:
+                                break
+                    if halign in ('right', 'center') and cell.kind == 's':
+                        idxs = pg.cols
+                        pos = idxs.index(c)
+                        for prv in reversed(idxs[:pos]):
+                            nc = sh.cells.get((r, prv))
+                            if (nc is not None and nc.text.strip()) or (r, prv) in sh.covered or (r, prv) in sh.master:
+                                break
+                            extra_l += col_w(prv)
+                            if tw <= avail + extra_l:
+                                break
+                    if halign == 'center':
+                        e = min(extra_l, extra_r)
+                        extra_l = extra_r = e
+                    clip_x, clip_w = x0 - extra_l, cw + extra_l + extra_r
+                    avail_total = avail + extra_l + extra_r
+                    if tw > avail_total:
+                        # shrink to fit (never below 55%), the rest is clipped
+                        k = max(0.55, avail_total / tw)
+                        size *= k
+                        tw = _text_width(text, cell.bold, cell.italic, size)
+                elif tw > avail:
+                    k = max(0.55, avail / tw)
+                    size *= k
+                lines = [text]
+            lh = size * 1.2
+            block = len(lines) * lh
+            if cell.valign == 'top':
+                ty = ytop - pad
+            elif cell.valign == 'center':
+                ty = ytop - (ch_ - block) / 2.0
+            else:
+                ty = ytop - ch_ + block + pad * 0.5
+            cv.saveState()
+            path = cv.beginPath()
+            path.rect(clip_x, ytop - ch_, clip_w, ch_)
+            cv.clipPath(path, stroke=0, fill=0)
+            for i, ln in enumerate(lines):
+                if not ln:
+                    continue
+                tw = _text_width(ln, cell.bold, cell.italic, size)
+                if halign == 'left':
+                    tx = x0 + pad + ind
+                elif halign == 'center':
+                    tx = x0 + (cw - tw) / 2.0
+                else:
+                    tx = x0 + cw - pad - tw
+                base_y = ty - i * lh - size * 0.95
+                _draw_text_line(cv, ln, cell.bold, cell.italic, size, tx, base_y, cell.color, cell.underline, cell.strike)
+            cv.restoreState()
+    # ---------- footer
+    if opts['footer']:
+        cv.setFillColor(_HexColor('#6B7280')); cv.setFont('Helvetica', 7)
+        name = sh.name if len(sh.name) < 60 else sh.name[:57] + '...'
+        for font, seg in _segments(name, False, False)[:1]:
+            pass
+        cv.drawString(M, 14, '')
+        _draw_text_line(cv, name, False, False, 7, M, 14, '6B7280')
+        cv.setFillColor(_HexColor('#6B7280')); cv.setFont('Helvetica', 7)
+        cv.drawCentredString(pg.pw / 2.0, 14, 'Page %d of %d' % (page_no, total))
+        cv.drawRightString(pg.pw - M, 14, brand)
+
+# --------------------------------------------------------------- entry point
+def _open_workbook(path):
+    from openpyxl import load_workbook, Workbook
+    with open(path, 'rb') as f:
+        head = f.read(8)
+    if head[:2] == b'PK':
+        import io as _io
+        with open(path, 'rb') as fh:          # a file object skips openpyxl's extension check
+            return load_workbook(_io.BytesIO(fh.read()), data_only=True, read_only=False, keep_links=False)
+    if head[:4] == b'\xd0\xcf\x11\xe0':          # old binary .xls
+        try:
+            import pandas as pd
+            sheets = pd.read_excel(path, sheet_name=None, header=None, engine='xlrd')
+        except Exception:
+            raise ValueError('Old .xls format could not be read. Please save the file as .xlsx in Excel and try again.')
+        wb = Workbook()
+        wb.remove(wb.active)
+        for name, df in sheets.items():
+            ws = wb.create_sheet(str(name)[:31] or 'Sheet')
+            for r_i, row in enumerate(df.itertuples(index=False), start=1):
+                for c_i, val in enumerate(row, start=1):
+                    if val is None or (isinstance(val, float) and val != val):
+                        continue
+                    if hasattr(val, 'to_pydatetime'):
+                        val = val.to_pydatetime()
+                    ws.cell(row=r_i, column=c_i, value=val)
+        return wb
+    raise ValueError('This does not look like a valid Excel file.')
+
+def excel_to_pdf_file(input_path, output_path, page_size='A4', orientation='auto', gridlines=True,
+                      repeat_header=True, fit_width=True, footer=True, smart_wrap=True, brand='BharatOS-Tools', max_pages=500):
+    _init_fonts()
+    opts = {'page_size': (page_size or 'A4').upper(), 'orientation': (orientation or 'auto').lower(),
+            'gridlines': bool(gridlines), 'repeat_header': bool(repeat_header), 'fit_width': bool(fit_width),
+            'footer': bool(footer), 'smart_wrap': bool(smart_wrap)}
+    if opts['page_size'] not in _PAGE_SIZES:
+        opts['page_size'] = 'A4'
+    if opts['orientation'] not in ('auto', 'portrait', 'landscape'):
+        opts['orientation'] = 'auto'
+    wb = _open_workbook(input_path)
+    theme = _theme_palette(wb)
+    plans = []
+    total_cells = 0
+    for ws in wb.worksheets:
+        if getattr(ws, 'sheet_state', 'visible') != 'visible':
+            continue
+        try:
+            sh = _load_sheet(ws, theme)
+        except Exception:
+            import traceback; traceback.print_exc()
+            continue
+        if sh is None:
+            continue
+        total_cells += len(sh.cells)
+        if total_cells > 350000:
+            raise ValueError('This workbook is too large for one conversion (more than 350,000 filled cells). Please split it into smaller files.')
+        plans.extend(_plan_sheet(sh, opts))
+        if len(plans) > max_pages:
+            raise ValueError('This workbook needs more than %d PDF pages. Please split the file.' % max_pages)
+    try:
+        wb.close()
+    except Exception:
+        pass
+    if not plans:
+        raise ValueError('Excel file is empty')
+    cv = _rl_canvas.Canvas(output_path, pagesize=(plans[0].pw, plans[0].ph))
+    cv.setTitle('Excel to PDF'); cv.setAuthor(brand)
+    total = len(plans)
+    for i, pg in enumerate(plans, start=1):
+        _draw_page(cv, pg, opts, i, total, brand)
+        cv.showPage()
+    cv.save()
+    return {'pages': total, 'sheets': len({id(p.sheet) for p in plans})}
+
+
 # ========== 6. EXCEL TO PDF ==========
+def _flag(value, default=True):
+    if value is None or str(value).strip() == '':
+        return default
+    return str(value).strip().lower() in ('1', 'true', 'yes', 'on')
+
 @app.route('/excel-to-pdf', methods=['POST'])
 def excel_to_pdf():
     if not processing_lock.acquire(timeout=300):
@@ -599,112 +1749,38 @@ def excel_to_pdf():
         if 'file' not in request.files:
             return 'No file uploaded', 400
         file = request.files['file']
-        valid, msg = validate_file(file, allowed_ext=['.xlsx', '.xls'], max_size=15 * 1024 * 1024)
+        valid, msg = validate_file(file, allowed_ext=['.xlsx', '.xlsm', '.xls'], max_size=15 * 1024 * 1024)
         if not valid:
             return msg, 400
         input_path = os.path.join(temp_dir, 'input.xlsx')
         output_path = os.path.join(temp_dir, 'output.pdf')
         file.save(input_path)
-        from openpyxl import load_workbook
-        from reportlab.lib.pagesizes import A4, landscape
-        from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-        from reportlab.lib.units import mm
-        from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, PageBreak
-        from reportlab.lib import colors
-        from datetime import datetime
 
-        def clean_cell(value):
-            if value is None: return ''
-            try:
-                s = str(value)
-                if s.lower() == 'nan' or s.lower() == 'none': return ''
-                return s.strip()
-            except: return ''
-
-        def calc_widths(table_data, max_cols=15):
-            if not table_data: return []
-            widths = []
-            for col_idx in range(min(len(table_data[0]), max_cols)):
-                max_len = 0
-                for row in table_data[:100]:
-                    if col_idx < len(row):
-                        max_len = max(max_len, len(str(row[col_idx]) if row[col_idx] else ''))
-                if max_len <= 5: w = 20 * mm
-                elif max_len <= 10: w = 28 * mm
-                elif max_len <= 20: w = 38 * mm
-                elif max_len <= 35: w = 50 * mm
-                else: w = 65 * mm
-                widths.append(w)
-            return widths
-
-        def smart_truncate(text, max_len=50):
-            text = str(text) if text is not None else ''
-            return text[:max_len - 3] + '...' if len(text) > max_len else text
-
-        def esc(text):
-            return str(text).replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
-
+        # optional settings sent by the website (all have safe defaults)
+        opts = dict(
+            page_size=request.form.get('page_size', 'A4'),
+            orientation=request.form.get('orientation', 'auto'),
+            gridlines=_flag(request.form.get('gridlines'), True),
+            repeat_header=_flag(request.form.get('repeat_header'), True),
+            fit_width=_flag(request.form.get('fit_width'), True),
+            footer=_flag(request.form.get('footer'), True),
+            smart_wrap=_flag(request.form.get('smart_wrap'), True),
+        )
         try:
-            wb = load_workbook(input_path, data_only=True, read_only=True)
-        except:
-            try:
-                wb = load_workbook(input_path, data_only=True, read_only=False)
-            except:
-                return 'Cannot read this Excel file.', 400
+            info = excel_to_pdf_file(input_path, output_path, **opts)
+        except ValueError as e:
+            return str(e), 400
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            return 'Cannot read this Excel file. It may be damaged or password protected.', 400
 
-        pdf = SimpleDocTemplate(output_path, pagesize=landscape(A4), leftMargin=10*mm, rightMargin=10*mm, topMargin=25*mm, bottomMargin=18*mm)
-        styles = getSampleStyleSheet()
-        title_style = ParagraphStyle('T', parent=styles['Heading1'], fontSize=18, textColor=colors.HexColor('#a855f7'), fontName='Helvetica-Bold')
-        sheet_style = ParagraphStyle('S', parent=styles['Heading2'], fontSize=13, textColor=colors.HexColor('#533483'), fontName='Helvetica-Bold')
-
-        story = [Paragraph('⚡ Bharat24Tools', title_style), Spacer(1, 6)]
-        total_sheets = len(wb.sheetnames)
-        total_rows = 0
-        MAX_COLS = 15
-
-        for s_idx, s_name in enumerate(wb.sheetnames):
-            try:
-                sheet = wb[s_name]
-            except: continue
-            raw_data = []
-            try:
-                for row in sheet.iter_rows(values_only=True):
-                    if row is None: continue
-                    cleaned = [clean_cell(c) for c in row[:MAX_COLS]]
-                    if any(cleaned): raw_data.append(cleaned)
-            except: continue
-            if not raw_data: continue
-            if total_sheets > 1:
-                story.append(Paragraph(f'📄 Sheet {s_idx + 1}: {esc(s_name)}', sheet_style))
-            else:
-                story.append(Paragraph(f'📄 Sheet: {esc(s_name)}', sheet_style))
-            display_data = []
-            for row in raw_data:
-                d = [smart_truncate(c, 50) for c in row]
-                while len(d) < MAX_COLS: d.append('')
-                display_data.append(d)
-            col_widths = calc_widths(display_data)
-            tbl = Table(display_data, colWidths=col_widths, repeatRows=1)
-            tbl.setStyle(TableStyle([
-                ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#a855f7')),
-                ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
-                ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-                ('FONTSIZE', (0, 0), (-1, 0), 9),
-                ('FONTSIZE', (0, 1), (-1, -1), 8),
-                ('GRID', (0, 0), (-1, -1), 0.4, colors.HexColor('#d1d5db')),
-                ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#f8f5ff')]),
-            ]))
-            story.append(tbl)
-            story.append(Spacer(1, 8))
-            total_rows += len(display_data) - 1
-            if s_idx < total_sheets - 1:
-                story.append(PageBreak())
-        try: wb.close()
-        except: pass
-        if total_rows == 0:
-            return 'Excel file is empty', 400
-        pdf.build(story)
-        return send_file(output_path, mimetype='application/pdf', as_attachment=True, download_name=f'Bharat24Tools_{file.filename.rsplit(".", 1)[0]}.pdf')
+        base = re.sub(r'[\\/\*\?\:"<>|]', '_', file.filename.rsplit('.', 1)[0])[:80] or 'excel'
+        response = send_file(output_path, mimetype='application/pdf', as_attachment=True, download_name=f'{base}.pdf')
+        response.headers['X-Pages'] = str(info['pages'])
+        response.headers['X-Sheets'] = str(info['sheets'])
+        response.headers['Access-Control-Expose-Headers'] = 'X-Pages, X-Sheets'
+        return response
     except Exception as e:
         import traceback
         traceback.print_exc()
