@@ -1367,18 +1367,28 @@ class _Page(object):
     pass
 
 def _plan_sheet(sh, opts):
+    image_mode = bool(opts.get('image_mode'))
     pw, ph = _PAGE_SIZES.get(opts['page_size'], _A4)
     M = 24.0
     foot = 20.0 if opts['footer'] else 8.0
     total_w = sum(sh.colw[c] for c in sh.cols)
     orient = opts['orientation']
-    if orient == 'auto':
+    if image_mode:
+        # the whole sheet becomes one picture: page = exactly the size of the content
+        M = 14.0
+        img_scale = min(1.0, float(opts.get('max_width_pt', 2600)) / total_w)
+        pw = total_w * img_scale + 2 * M
+        ph = float(opts.get('max_height_pt', 6000))
+        foot = 0.0
+    elif orient == 'auto':
         if not opts['fit_width']:
             orient = 'landscape' if (sh.landscape_hint or total_w > pw - 2 * M) else 'portrait'
         else:
             scale_p = min(1.0, (pw - 2 * M) / total_w)
             orient = 'portrait' if (scale_p >= 0.75 and not sh.landscape_hint) or scale_p >= 0.999 else 'landscape'
-    if orient == 'landscape':
+    if image_mode:
+        pass
+    elif orient == 'landscape':
         pw, ph = max(pw, ph), min(pw, ph)
     else:
         pw, ph = min(pw, ph), max(pw, ph)
@@ -1387,7 +1397,9 @@ def _plan_sheet(sh, opts):
     # ---- column bands
     MIN_SCALE = 0.55
     bands = []
-    if opts['fit_width'] and total_w * MIN_SCALE <= usable_w:
+    if image_mode:
+        bands = [list(sh.cols)]
+    elif opts['fit_width'] and total_w * MIN_SCALE <= usable_w:
         bands = [list(sh.cols)]
     else:
         cap = usable_w / 0.7 if opts['fit_width'] else usable_w
@@ -1413,6 +1425,8 @@ def _plan_sheet(sh, opts):
         band_w = sum(sh.colw[c] for c in band)
         scale = min(1.0, usable_w / band_w) if (opts['fit_width'] or band_w > usable_w) else 1.0
         scale = max(scale, 0.25)
+        if image_mode:
+            scale = img_scale
         header = sh.rows[0] if (opts['repeat_header'] and len(sh.rows) > 1) else None
         hdr_h = heights[header] * scale if header is not None else 0.0
         idx = 0
@@ -1445,6 +1459,9 @@ def _plan_sheet(sh, opts):
             p = _Page()
             p.sheet, p.rows, p.cols, p.scale = sh, page_rows, band, scale
             p.pw, p.ph, p.heights = pw, ph, heights
+            p.M = M
+            if image_mode:      # shrink the picture to the real content height
+                p.ph = 2 * M + sum(heights[r] for r in page_rows) * scale
             pages.append(p)
             first = False
     return pages
@@ -1479,7 +1496,7 @@ def _draw_text_line(cv, text, bold, italic, size, x, y, color, underline=False, 
 def _draw_page(cv, pg, opts, page_no, total, brand):
     sh, s = pg.sheet, pg.scale
     cv.setPageSize((pg.pw, pg.ph))
-    M = 24.0
+    M = getattr(pg, 'M', 24.0)
     col_x, x = {}, M
     for c in pg.cols:
         col_x[c] = x
@@ -1668,32 +1685,63 @@ def _open_workbook(path):
         import io as _io
         with open(path, 'rb') as fh:          # a file object skips openpyxl's extension check
             return load_workbook(_io.BytesIO(fh.read()), data_only=True, read_only=False, keep_links=False)
-    if head[:4] == b'\xd0\xcf\x11\xe0':          # old binary .xls
+    if head[:4] == b'\xd0\xcf\x11\xe0':          # old binary .xls  (needs the small 'xlrd' package)
         try:
-            import pandas as pd
-            sheets = pd.read_excel(path, sheet_name=None, header=None, engine='xlrd')
+            import xlrd
+        except ImportError:
+            raise ValueError('Old .xls format is not supported on this server. Please save the file as .xlsx in Excel and try again.')
+        try:
+            try:
+                book = xlrd.open_workbook(path, formatting_info=True)    # also gives column widths
+            except Exception:
+                book = xlrd.open_workbook(path)
         except Exception:
             raise ValueError('Old .xls format could not be read. Please save the file as .xlsx in Excel and try again.')
+        from openpyxl.utils import get_column_letter
         wb = Workbook()
         wb.remove(wb.active)
-        for name, df in sheets.items():
-            ws = wb.create_sheet(str(name)[:31] or 'Sheet')
-            for r_i, row in enumerate(df.itertuples(index=False), start=1):
-                for c_i, val in enumerate(row, start=1):
-                    if val is None or (isinstance(val, float) and val != val):
+        for idx in range(book.nsheets):
+            sh = book.sheet_by_index(idx)
+            if getattr(sh, 'visibility', 0) != 0:
+                continue
+            ws = wb.create_sheet(str(sh.name)[:31] or 'Sheet%d' % (idx + 1))
+            for r in range(sh.nrows):
+                for c in range(sh.ncols):
+                    ctype = sh.cell_type(r, c)
+                    if ctype in (0, 5, 6):          # empty / error / blank
                         continue
-                    if hasattr(val, 'to_pydatetime'):
-                        val = val.to_pydatetime()
-                    ws.cell(row=r_i, column=c_i, value=val)
+                    val = sh.cell_value(r, c)
+                    if ctype == 3:                   # date
+                        try:
+                            val = xlrd.xldate_as_datetime(val, book.datemode)
+                        except Exception:
+                            pass
+                    elif ctype == 4:
+                        val = bool(val)
+                    elif ctype == 2 and float(val) == int(val) and abs(val) < 1e15:
+                        val = int(val)
+                    ws.cell(row=r + 1, column=c + 1, value=val)
+            try:
+                for c, info in (getattr(sh, 'colinfo_map', {}) or {}).items():
+                    if info.width:
+                        ws.column_dimensions[get_column_letter(c + 1)].width = max(2.0, info.width / 256.0)
+                    if info.hidden:
+                        ws.column_dimensions[get_column_letter(c + 1)].hidden = True
+            except Exception:
+                pass
+        if not wb.worksheets:
+            raise ValueError('Excel file is empty')
         return wb
     raise ValueError('This does not look like a valid Excel file.')
 
 def excel_to_pdf_file(input_path, output_path, page_size='A4', orientation='auto', gridlines=True,
-                      repeat_header=True, fit_width=True, footer=True, smart_wrap=True, brand='BharatOS-Tools', max_pages=500):
+                      repeat_header=True, fit_width=True, footer=True, smart_wrap=True, brand='BharatOS-Tools', max_pages=500,
+                      image_mode=False, max_width_pt=2600, max_height_pt=6000):
     _init_fonts()
     opts = {'page_size': (page_size or 'A4').upper(), 'orientation': (orientation or 'auto').lower(),
             'gridlines': bool(gridlines), 'repeat_header': bool(repeat_header), 'fit_width': bool(fit_width),
-            'footer': bool(footer), 'smart_wrap': bool(smart_wrap)}
+            'footer': bool(footer), 'smart_wrap': bool(smart_wrap), 'image_mode': bool(image_mode),
+            'max_width_pt': max_width_pt, 'max_height_pt': max_height_pt}
     if opts['page_size'] not in _PAGE_SIZES:
         opts['page_size'] = 'A4'
     if opts['orientation'] not in ('auto', 'portrait', 'landscape'):
@@ -1717,7 +1765,7 @@ def excel_to_pdf_file(input_path, output_path, page_size='A4', orientation='auto
             raise ValueError('This workbook is too large for one conversion (more than 350,000 filled cells). Please split it into smaller files.')
         plans.extend(_plan_sheet(sh, opts))
         if len(plans) > max_pages:
-            raise ValueError('This workbook needs more than %d PDF pages. Please split the file.' % max_pages)
+            raise ValueError('This workbook needs more than %d pages. Please split the file into smaller files.' % max_pages)
     try:
         wb.close()
     except Exception:
@@ -1731,7 +1779,8 @@ def excel_to_pdf_file(input_path, output_path, page_size='A4', orientation='auto
         _draw_page(cv, pg, opts, i, total, brand)
         cv.showPage()
     cv.save()
-    return {'pages': total, 'sheets': len({id(p.sheet) for p in plans})}
+    return {'pages': total, 'sheets': len({id(p.sheet) for p in plans}),
+            'page_sheets': [p.sheet.name for p in plans], 'page_sizes': [(p.pw, p.ph) for p in plans]}
 
 
 # ========== 6. EXCEL TO PDF ==========
@@ -1789,6 +1838,365 @@ def excel_to_pdf():
         processing_lock.release()
         cleanup_dir(temp_dir)
 
+# ======================================================================
+#  PDF -> EXCEL ENGINE  (BharatOS-Tools)
+#  Rebuilds the real table structure of a PDF in Excel:
+#   * bordered tables  -> one Excel table (pdfplumber)
+#   * forms / tickets / invoices / statements without borders -> text is
+#     split into columns by its position on the page, so every value
+#     lands in its own cell (never "whole line in one cell")
+#   * normal paragraphs -> one line per row
+#  Numbers become real numbers, bold text stays bold, one sheet per page.
+# ======================================================================
+import re as _re
+import statistics as _stats
+import subprocess as _subprocess
+
+_PX_NUM = _re.compile(r'(\(?)(-?)\s*(Rs\.?|INR|[\u20b9$\u20ac\u00a3])?\s*(\d{1,3}(?:,\d{2,3})+(?:\.\d+)?|\d+(?:\.\d+)?)(\)?)\s*(%?)$')
+_PX_BOLD = ('bold', 'black', 'heavy', 'semibold', 'demi')
+
+def _px_value(text, numbers=True):
+    """-> (value, number_format or None). IDs, phone numbers, dates stay text."""
+    t = (text or '').strip()
+    if not numbers or not t:
+        return t, None
+    m = _PX_NUM.match(t)
+    if not m:
+        return t, None
+    paren_open, minus, sym, digits, paren_close, pct = m.groups()
+    if paren_open and not paren_close or paren_close and not paren_open:
+        return t, None
+    raw = digits.replace(',', '')
+    int_part, _, frac = raw.partition('.')
+    if len(int_part) > 15:
+        return t, None
+    if len(int_part) > 1 and int_part.startswith('0'):
+        return t, None                                  # 0000003940, 007 ... keep as text
+    if len(int_part) >= 10 and not frac and not sym and not ',' in digits:
+        return t, None                                  # phone numbers / long IDs
+    try:
+        val = float(raw)
+    except ValueError:
+        return t, None
+    if minus or (paren_open and paren_close):
+        val = -val
+    if pct:
+        val = val / 100.0
+    base = '#,##0' if ',' in digits else '0'
+    if frac:
+        base += '.' + '0' * len(frac)
+    if sym:
+        s = 'Rs.' if sym.upper().startswith(('RS', 'INR')) else sym
+        base = '"%s "%s' % (s, base) if s in ('Rs.',) else '"%s"%s' % (s, base)
+    fmt = base + ('%' if pct else '')
+    if not frac and not pct and ',' not in digits and not sym:
+        fmt = None
+    if val == int(val) and not frac and not pct:
+        val = int(val)
+    return val, fmt
+
+# --------------------------------------------------------------- reading
+class _PxSeg(object):
+    __slots__ = ('x0', 'x1', 'text', 'bold')
+    def __init__(self, x0, x1, text, bold):
+        self.x0, self.x1, self.text, self.bold = x0, x1, text, bold
+
+class _PxLine(object):
+    __slots__ = ('top', 'bottom', 'size', 'segs')
+
+def _px_split_segments(words, gap_thr):
+    words = sorted(words, key=lambda w: w['x0'])
+    segs, cur = [], []
+    for w in words:
+        if cur and w['x0'] - cur[-1]['x1'] > gap_thr:
+            segs.append(cur); cur = []
+        cur.append(w)
+    if cur:
+        segs.append(cur)
+    out = []
+    for grp in segs:
+        chars = sum(len(w['text']) for w in grp) or 1
+        bold_chars = sum(len(w['text']) for w in grp if w.get('bold'))
+        out.append(_PxSeg(grp[0]['x0'], grp[-1]['x1'], ' '.join(w['text'] for w in grp), bold_chars * 2 >= chars))
+    return out
+
+def _px_words_to_lines(words):
+    lines = []
+    for w in sorted(words, key=lambda w: (w['top'], w['x0'])):
+        mid = (w['top'] + w['bottom']) / 2.0
+        if lines and abs(mid - lines[-1]['mid']) <= 0.5 * max(w['size'], lines[-1]['size']):
+            ln = lines[-1]
+            ln['words'].append(w)
+            ln['top'] = min(ln['top'], w['top']); ln['bottom'] = max(ln['bottom'], w['bottom'])
+            ln['size'] = max(ln['size'], w['size'])
+        else:
+            lines.append({'mid': mid, 'top': w['top'], 'bottom': w['bottom'], 'size': w['size'], 'words': [w]})
+    out = []
+    for ln in lines:
+        l = _PxLine()
+        l.top, l.bottom, l.size = ln['top'], ln['bottom'], ln['size']
+        l.segs = _px_split_segments(ln['words'], max(4.8, 0.55 * ln['size']))
+        out.append(l)
+    return out
+
+def _px_page_plumber(page):
+    """-> (page_width, items) ; items = ('table', top, bottom, rows) | ('line', _PxLine)"""
+    W = float(page.width)
+    tables = []
+    try:
+        for t in page.find_tables():
+            rows = t.extract() or []
+            clean = [[(c or '').replace('\n', ' ').strip() for c in r] for r in rows]
+            clean = [r for r in clean if any(r)]
+            if len(clean) < 2:
+                continue
+            ncols = max(len(r) for r in clean)
+            clean = [r + [''] * (ncols - len(r)) for r in clean]
+            keep = [j for j in range(ncols) if any(r[j] for r in clean)]
+            clean = [[r[j] for j in keep] for r in clean]
+            if len(keep) < 2:
+                continue
+            filled = sum(1 for r in clean for c in r if c) / float(len(clean) * len(keep))
+            if filled < 0.3:
+                continue
+            tables.append((t.bbox, clean))
+    except Exception:
+        tables = []
+    words = []
+    for w in page.extract_words(x_tolerance=1.5, y_tolerance=2, keep_blank_chars=False, use_text_flow=False, extra_attrs=['fontname', 'size']):
+        cx, cy = (w['x0'] + w['x1']) / 2.0, (w['top'] + w['bottom']) / 2.0
+        if any(b[0] - 1 <= cx <= b[2] + 1 and b[1] - 1 <= cy <= b[3] + 1 for b, _ in tables):
+            continue
+        w['bold'] = any(k in (w.get('fontname') or '').lower() for k in _PX_BOLD)
+        words.append(w)
+    items = [('table', b[1], b[3], rows) for b, rows in tables]
+    items += [('line', l) for l in _px_words_to_lines(words)]
+    items.sort(key=lambda it: it[1] if it[0] == 'table' else it[1].top)
+    return W, items
+
+def _px_page_text(text):
+    """Fallback when pdfplumber is not installed: Ghostscript 'txtwrite' text keeps the layout with spaces."""
+    items, width = [], 1.0
+    for i, raw in enumerate(text.split('\n')):
+        raw = raw.rstrip()
+        if not raw.strip():
+            continue
+        l = _PxLine(); l.top, l.bottom, l.size = i * 12.0, i * 12.0 + 10.0, 10.0
+        l.segs = [_PxSeg(float(m.start()), float(m.end()), m.group(), False) for m in _re.finditer(r'\S+(?: {1,2}\S+)*', raw)]
+        width = max(width, len(raw))
+        items.append(('line', l))
+    return float(width), items
+
+# ------------------------------------------------------------ layout
+def _px_layout(items, page_w, tol):
+    """-> rows: {'cells': {col: (text, bold)}, 'merges': [(c1, c2)], 'kind': 'text'|'grid'|'table', 'hdr': bool, 'blank': bool, 'size': float}"""
+    rows, pending = [], []
+    prev_bottom, prev_size = None, 10.0
+
+    def flush():
+        nonlocal prev_bottom, prev_size
+        if not pending:
+            return
+        lines = list(pending); pending.clear()
+        multi = [len(l.segs) >= 2 for l in lines]
+        groups, cur = [], []
+        for i, l in enumerate(lines):
+            if multi[i]:
+                if cur and l.top - cur[-1].bottom > 1.8 * max(l.size, cur[-1].size):
+                    groups.append(('grid', cur)); cur = []
+                cur.append(l)
+            else:
+                if cur:
+                    groups.append(('grid', cur)); cur = []
+                groups.append(('text', [l]))
+        if cur:
+            groups.append(('grid', cur))
+        for kind, grp in groups:
+            if kind == 'text':
+                l = grp[0]
+                blank = prev_bottom is not None and (l.top - prev_bottom) > 0.7 * max(l.size, prev_size)
+                rows.append({'cells': {0: (l.segs[0].text, l.segs[0].bold)}, 'merges': [], 'kind': 'text', 'hdr': False, 'blank': blank, 'size': l.size})
+                prev_bottom, prev_size = l.bottom, l.size
+                continue
+            ivs = sorted((s.x0, s.x1) for l in grp for s in l.segs if (s.x1 - s.x0) <= 0.6 * page_w)
+            spans = []
+            for a, b in ivs:
+                if spans and a <= spans[-1][1] + tol:
+                    spans[-1][1] = max(spans[-1][1], b)
+                else:
+                    spans.append([a, b])
+            if not spans:
+                spans = [[min(s.x0 for l in grp for s in l.segs), max(s.x1 for l in grp for s in l.segs)]]
+
+            def span_of(s):
+                cx = (s.x0 + s.x1) / 2.0
+                k = next((k for k, sp in enumerate(spans) if sp[0] - tol <= cx <= sp[1] + tol), None)
+                if k is None:
+                    k = next((k for k, sp in enumerate(spans) if sp[1] >= s.x0 - tol), len(spans) - 1)
+                return k
+            # A header that does not sit exactly above its numbers (e.g. 'Amount' left of right-aligned figures)
+            # makes two spans that never appear in the same row: they are one logical column.
+            while len(grp) >= 3 and len(spans) > 1:
+                used_by_row = [set(span_of(s) for s in l.segs if (s.x1 - s.x0) <= 0.6 * page_w) for l in grp]
+                pair = next((k for k in range(len(spans) - 1)
+                             if any(k in u for u in used_by_row) and any(k + 1 in u for u in used_by_row)
+                             and not any(k in u and k + 1 in u for u in used_by_row)), None)
+                if pair is None:
+                    break
+                spans[pair] = [spans[pair][0], spans[pair + 1][1]]
+                del spans[pair + 1]
+            for gi, l in enumerate(grp):
+                cells, merges, used = {}, [], set()
+                for s in l.segs:
+                    idx = span_of(s)
+                    while idx in used:
+                        idx += 1
+                    used.add(idx)
+                    cells[idx] = (s.text, s.bold)
+                    last = max([k for k, sp in enumerate(spans) if sp[0] < s.x1 - tol and sp[1] > s.x0 + tol] or [idx])
+                    if last > idx and all(k not in used for k in range(idx + 1, last + 1)):
+                        merges.append((idx, last)); used.update(range(idx + 1, last + 1))
+                hdr = all(b for _, b in cells.values()) and len(cells) >= 2
+                blank = (gi == 0 and prev_bottom is not None and (l.top - prev_bottom) > 0.7 * max(l.size, prev_size)) or \
+                        (gi > 0 and (l.top - grp[gi - 1].bottom) > 0.9 * max(l.size, grp[gi - 1].size))
+                rows.append({'cells': cells, 'merges': merges, 'kind': 'grid', 'hdr': hdr, 'blank': blank, 'size': l.size})
+                prev_bottom, prev_size = l.bottom, l.size
+
+    for it in items:
+        if it[0] == 'line':
+            pending.append(it[1])
+        else:
+            flush()
+            top, bottom, tbl = it[1], it[2], it[3]
+            blank = prev_bottom is not None and (top - prev_bottom) > 0.7 * prev_size
+            for ri, r in enumerate(tbl):
+                rows.append({'cells': {j: (c, ri == 0) for j, c in enumerate(r) if c != ''}, 'merges': [], 'kind': 'table',
+                             'hdr': ri == 0, 'blank': blank and ri == 0, 'size': 10.0})
+            prev_bottom, prev_size = bottom, 10.0
+    flush()
+    return rows
+
+# --------------------------------------------------------------- writing
+def _px_write(ws, rows, numbers, start_row=1):
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+    thin = Side(style='thin', color='BFC5D2')
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    fill_hdr = PatternFill('solid', fgColor='EDE9FE')
+    sizes = [r['size'] for r in rows if r['kind'] != 'table'] or [10.0]
+    body = _stats.median(sizes)
+    widths, r = {}, start_row
+    grid_rows = [x for x in rows if x['kind'] in ('grid', 'table')]
+    for row in rows:
+        if row['blank']:
+            r += 1
+        ncell = len(row['cells'])
+        for col, (text, bold) in row['cells'].items():
+            val, fmt = _px_value(text, numbers)
+            c = ws.cell(row=r, column=col + 1, value=val)
+            if fmt:
+                c.number_format = fmt
+            big = row['kind'] == 'text' and row['size'] >= body * 1.3
+            if bold or row['hdr'] or big:
+                c.font = Font(bold=True, size=14 if big else 11)
+            if row['kind'] == 'table' or (row['kind'] == 'grid' and ncell >= 2):
+                c.border = border
+                c.alignment = Alignment(vertical='top', wrap_text=False)
+            if row['hdr'] and row['kind'] in ('table', 'grid'):
+                c.fill = fill_hdr
+            if row['kind'] != 'text':
+                widths[col] = max(widths.get(col, 0), len(str(text)))
+        for c1, c2 in row['merges']:
+            ws.merge_cells(start_row=r, start_column=c1 + 1, end_row=r, end_column=c2 + 1)
+        r += 1
+    for col, n in widths.items():
+        ws.column_dimensions[get_column_letter(col + 1)].width = max(9, min(55, n * 1.12 + 2))
+    if 0 not in widths:
+        longest = max([len(str(v[0])) for x in rows for v in x['cells'].values()] or [20])
+        ws.column_dimensions['A'].width = max(24, min(100, longest * 1.05 + 2))
+    return r
+
+# --------------------------------------------------------------- entry point
+def _px_pages_plumber(path, max_pages):
+    import pdfplumber
+    out = []
+    with pdfplumber.open(path) as pdf:
+        for i, page in enumerate(pdf.pages[:max_pages]):
+            try:
+                out.append(_px_page_plumber(page))
+            except Exception:
+                import traceback; traceback.print_exc()
+                out.append((1.0, []))
+    return out
+
+def _px_pages_gs(path, timeout):
+    import os as _o, tempfile as _t
+    tmp = _o.path.join(_t.mkdtemp(), 'x.txt')
+    _subprocess.run(['gs', '-sDEVICE=txtwrite', '-dNOPAUSE', '-dBATCH', '-dQUIET', '-dMaxBitmap=500000000',
+                     '-sOutputFile=' + tmp, path], check=True, timeout=timeout, capture_output=True)
+    with open(tmp, 'r', encoding='utf-8', errors='ignore') as f:
+        text = f.read()
+    try:
+        _o.remove(tmp)
+    except Exception:
+        pass
+    pages = text.split('\f') if '\f' in text else [text]
+    return [_px_page_text(p) for p in pages if p.strip()]
+
+def pdf_to_excel_file(input_path, output_path, sheets='page', numbers=True, max_pages=200, timeout=120):
+    from openpyxl import Workbook
+    pages, engine = None, 'text'
+    try:
+        pages = _px_pages_plumber(input_path, max_pages)
+        engine = 'layout'
+    except ImportError:
+        pages = None
+    except Exception:
+        import traceback; traceback.print_exc()
+        pages = None
+    if pages is None or not any(items for _, items in pages):
+        try:
+            pages = _px_pages_gs(input_path, timeout)
+            engine = 'text'
+        except Exception:
+            if pages is None:
+                raise ValueError('Could not read this PDF. It may be damaged or password protected.')
+    pages = [(w, items) for w, items in pages]
+    if not any(items for _, items in pages):
+        raise ValueError('No text found in this PDF. It looks like a scanned image - text cannot be extracted from scans.')
+    tol = 1.5 if engine == 'layout' else 0.0
+    wb = Workbook(); wb.remove(wb.active)
+    n_tables = 0
+    if sheets == 'single' and len(pages) > 1:
+        ws = wb.create_sheet('All Pages'); r = 1
+        seen_headers = set()
+        from openpyxl.styles import Font
+        for n, (w, items) in enumerate(pages, start=1):
+            if not items:
+                continue
+            ws.cell(row=r, column=1, value='Page %d' % n).font = Font(bold=True, color='6D28D9')
+            rows = _px_layout(items, w, tol)
+            n_tables += sum(1 for it in items if it[0] == 'table')
+            clean = []
+            for row in rows:
+                if row['kind'] == 'table' and row['hdr']:
+                    sig = tuple(v[0] for _, v in sorted(row['cells'].items()))
+                    if sig in seen_headers:
+                        continue
+                    seen_headers.add(sig)
+                clean.append(row)
+            r = _px_write(ws, clean, numbers, start_row=r + 1) + 1
+    else:
+        for n, (w, items) in enumerate(pages, start=1):
+            if not items:
+                continue
+            ws = wb.create_sheet('Page %d' % n)
+            n_tables += sum(1 for it in items if it[0] == 'table')
+            _px_write(ws, _px_layout(items, w, tol), numbers)
+    wb.save(output_path)
+    return {'pages': len(pages), 'sheets': len(wb.worksheets), 'engine': engine, 'tables': n_tables}
+
+
 # ========== 7. PDF TO EXCEL ==========
 @app.route('/pdf-to-excel', methods=['POST'])
 def pdf_to_excel():
@@ -1800,34 +2208,31 @@ def pdf_to_excel():
             return 'No file uploaded', 400
         file = request.files['file']
         valid, msg = validate_file(file, allowed_ext=['.pdf'])
-        if not valid: return msg, 400
+        if not valid:
+            return msg, 400
         input_path = os.path.join(temp_dir, 'input.pdf')
-        txt_path = os.path.join(temp_dir, 'extracted.txt')
         output_path = os.path.join(temp_dir, 'output.xlsx')
         file.save(input_path)
-        subprocess.run(['gs', '-sDEVICE=txtwrite', '-dNOPAUSE', '-dBATCH', '-dQUIET', '-dMaxBitmap=500000000', f'-sOutputFile={txt_path}', input_path], check=True, timeout=PROCESSING_TIMEOUT, capture_output=True)
-        if not os.path.exists(txt_path): return 'Text extraction failed', 500
-        with open(txt_path, 'r', encoding='utf-8', errors='ignore') as f: text = f.read()
-        if not text.strip(): return 'No text found in PDF', 400
-        from openpyxl import Workbook
-        from openpyxl.styles import Font, PatternFill, Alignment
-        wb = Workbook()
-        ws = wb.active
-        ws.title = 'PDF Content'
-        ws['A1'] = 'Extracted from PDF'
-        ws['A1'].font = Font(bold=True, size=14, color='FFFFFF')
-        ws['A1'].fill = PatternFill('solid', fgColor='A855F7')
-        ws.merge_cells('A1:C1')
-        row = 3
-        for line in text.split('\n'):
-            if line.strip():
-                ws.cell(row=row, column=1, value=line.strip())
-                row += 1
-        ws.column_dimensions['A'].width = 100
-        wb.save(output_path)
-        return send_file(output_path, mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', as_attachment=True, download_name='converted.xlsx')
+        try:
+            info = pdf_to_excel_file(
+                input_path, output_path,
+                sheets='single' if (request.form.get('sheets', 'page') or 'page').lower() == 'single' else 'page',
+                numbers=_flag(request.form.get('numbers'), True),
+                timeout=PROCESSING_TIMEOUT,
+            )
+        except ValueError as e:
+            return str(e), 400
+        base = re.sub(r'[\\/\*\?\:"<>|]', '_', file.filename.rsplit('.', 1)[0])[:80] or 'converted'
+        response = send_file(output_path, mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                             as_attachment=True, download_name=f'{base}.xlsx')
+        response.headers['X-Pages'] = str(info['pages'])
+        response.headers['X-Tables'] = str(info['tables'])
+        response.headers['X-Engine'] = info['engine']
+        response.headers['Access-Control-Expose-Headers'] = 'X-Pages, X-Tables, X-Engine'
+        return response
     except Exception as e:
-        print(f'❌ PDF to Excel error: {e}', flush=True)
+        import traceback
+        traceback.print_exc()
         return f'Error: {str(e)}', 500
     finally:
         processing_lock.release()
