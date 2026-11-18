@@ -16,3 +16,4 @@ numpy==1.26.4
 google-genai==0.3.0
 PyMuPDF==1.23.8
 xlrd==2.0.1
+pikepdf==8.15.1

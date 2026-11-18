@@ -192,7 +192,459 @@ def health():
         'sketch_formats': ['png', 'jpg', 'webp']
     }
 
-# ========== 1. COMPRESS PDF (ADVANCED AI SCANNER MODE) ==========
+# ======================================================================
+#  PDF COMPRESS ENGINE  (BharatOS-Tools)
+#   1. lossless clean-up          (always tried first - no quality loss)
+#   2. smart image recompression  (text stays real, selectable text)
+#      images are downsampled to a DPI limit measured from how large they
+#      are really placed on the page, then JPEG re-encoded; a ladder of 24
+#      quality steps is searched so the result lands just UNDER the target
+#   3. scanner mode               (only if allowed and really needed:
+#      pages become pictures; DPI is searched to hit the target)
+#  An image is only replaced if the new version is really smaller.
+# ======================================================================
+import io as _io
+import os as _os
+import re as _re
+import glob as _glob
+import math as _math
+import time as _time
+import shutil as _shutil
+import subprocess as _subprocess
+
+_CP_PRESETS = {                      # (max image dpi, jpeg quality)
+    'high':        (220, 85),
+    'recommended': (150, 72),
+    'extreme':     (96, 48),
+}
+_CP_MIN_TARGET = 10 * 1024
+
+def _cp_log(msg):
+    print(msg, flush=True)
+
+# ------------------------------------------------------------- ladder
+def _cp_ladder(max_dpi=300, max_q=92, n=24, min_dpi=36, min_q=20):
+    max_dpi = max(min_dpi + 1, int(max_dpi)); max_q = max(min_q + 1, int(max_q))
+    out = []
+    for i in range(n):
+        t = i / float(n - 1)
+        dpi = int(round(max_dpi * ((float(min_dpi) / max_dpi) ** t)))
+        q = int(round(max_q - (max_q - min_q) * (t ** 0.85)))
+        out.append((dpi, q))
+    return out
+
+# ----------------------------------------------------- image analysis
+def _cp_mul(m, c):
+    return [m[0] * c[0] + m[1] * c[2], m[0] * c[1] + m[1] * c[3],
+            m[2] * c[0] + m[3] * c[2], m[2] * c[1] + m[3] * c[3],
+            m[4] * c[0] + m[5] * c[2] + c[4], m[4] * c[1] + m[5] * c[3] + c[5]]
+
+def _cp_placement_dpis(pdf, deadline):
+    """{objgen: highest effective dpi} using the real size an image is drawn at on the page."""
+    import pikepdf
+    dpis = {}
+    def walk(content, resources, ctm, depth, seen):
+        if _time.time() > deadline or content is None:
+            return
+        try:
+            instrs = pikepdf.parse_content_stream(content)
+        except Exception:
+            return
+        stack, cur = [], ctm
+        xobjs = None
+        try:
+            xobjs = resources.get('/XObject') if resources is not None else None
+        except Exception:
+            xobjs = None
+        for ins in instrs:
+            op = str(ins.operator)
+            if op == 'q':
+                stack.append(cur)
+            elif op == 'Q':
+                if stack:
+                    cur = stack.pop()
+            elif op == 'cm':
+                try:
+                    cur = _cp_mul([float(x) for x in ins.operands], cur)
+                except Exception:
+                    pass
+            elif op == 'Do' and xobjs is not None:
+                try:
+                    xo = xobjs.get(str(ins.operands[0]))
+                except Exception:
+                    xo = None
+                if xo is None:
+                    continue
+                sub = xo.get('/Subtype')
+                if sub == '/Image':
+                    wpt = _math.hypot(cur[0], cur[1]); hpt = _math.hypot(cur[2], cur[3])
+                    if wpt > 0.5 and hpt > 0.5:
+                        d = max(float(xo.get('/Width', 0)) / (wpt / 72.0), float(xo.get('/Height', 0)) / (hpt / 72.0))
+                        k = xo.objgen
+                        dpis[k] = max(dpis.get(k, 0), d)
+                elif sub == '/Form' and depth < 4 and xo.objgen not in seen:
+                    try:
+                        fm = [float(x) for x in xo.get('/Matrix', [1, 0, 0, 1, 0, 0])]
+                    except Exception:
+                        fm = [1, 0, 0, 1, 0, 0]
+                    walk(xo, xo.get('/Resources', resources), _cp_mul(fm, cur), depth + 1, seen | {xo.objgen})
+    for page in pdf.pages:
+        res = None
+        try:
+            res = page.resources
+        except Exception:
+            res = page.obj.get('/Resources')
+        walk(page, res, [1, 0, 0, 1, 0, 0], 0, frozenset())
+        if _time.time() > deadline:
+            break
+    return dpis
+
+class _CpImage(object):
+    __slots__ = ('key', 'w', 'h', 'orig_len', 'cs')
+
+def _cp_collect(pdf, dpis_deadline):
+    """-> (list of _CpImage that can be safely recompressed, total image count)"""
+    import pikepdf
+    from pikepdf import PdfImage
+    masks, cands, total = set(), [], 0
+    for obj in pdf.objects:
+        if not isinstance(obj, pikepdf.Stream) or obj.get('/Subtype') != '/Image':
+            continue
+        total += 1
+        for k in ('/SMask', '/Mask'):
+            m = obj.get(k)
+            if isinstance(m, pikepdf.Stream):
+                masks.add(m.objgen)
+        cands.append(obj)
+    out = []
+    for obj in cands:
+        try:
+            if obj.objgen in masks or bool(obj.get('/ImageMask', False)):
+                continue
+            if isinstance(obj.get('/Mask'), pikepdf.Array) or '/Decode' in obj:
+                continue
+            w, h = int(obj.get('/Width', 0)), int(obj.get('/Height', 0))
+            if w * h < 12000 or int(obj.get('/BitsPerComponent', 8)) != 8:
+                continue
+            flt = obj.get('/Filter')
+            flt = [str(x) for x in flt] if isinstance(flt, pikepdf.Array) else ([str(flt)] if flt is not None else [])
+            if any(f in ('/JBIG2Decode', '/CCITTFaxDecode', '/JPXDecode', '/RunLengthDecode') for f in flt):
+                continue
+            pim = PdfImage(obj)
+            cs = str(pim.colorspace)
+            if cs not in ('/DeviceRGB', '/DeviceGray', '/ICCBased', '/Indexed', '/CalRGB', '/CalGray'):
+                continue
+            raw_len = len(obj.read_raw_bytes())
+            if raw_len < 4000:
+                continue
+            ci = _CpImage(); ci.key, ci.w, ci.h, ci.orig_len, ci.cs = obj.objgen, w, h, raw_len, cs
+            out.append(ci)
+        except Exception:
+            continue
+    return out, total
+
+class _CpWorkspace(object):
+    """Holds decoded images between trials so each trial is fast."""
+    def __init__(self, input_path, budget_deadline):
+        import pikepdf
+        self.path = input_path
+        self.deadline = budget_deadline
+        pdf = pikepdf.open(input_path)
+        try:
+            self.images, self.total_images = _cp_collect(pdf, budget_deadline)
+            self.dpis = _cp_placement_dpis(pdf, min(budget_deadline, _time.time() + 12))
+        finally:
+            pdf.close()
+        self.pil = {}
+        self.pil_bytes = 0
+        self.image_bytes = sum(i.orig_len for i in self.images)
+
+    def _decode(self, obj, ci):
+        if ci.key in self.pil:
+            return self.pil[ci.key]
+        from pikepdf import PdfImage
+        im = PdfImage(obj).as_pil_image()
+        if im.mode in ('P', 'RGBA'):
+            im = im.convert('RGB')
+        elif im.mode == 'LA':
+            im = im.convert('L')
+        if im.mode not in ('RGB', 'L'):
+            return None
+        sz = im.width * im.height * len(im.getbands())
+        if self.pil_bytes + sz <= 350 * 1024 * 1024:
+            self.pil[ci.key] = im
+            self.pil_bytes += sz
+        return im
+
+    def trial(self, out_path, max_dpi=None, quality=None, gray=False, optimize=True, strip_meta=False):
+        """Write one candidate PDF. max_dpi=None -> lossless only. Returns (size, images_recompressed)."""
+        import pikepdf
+        from pikepdf import Name
+        from PIL import Image
+        resample = getattr(getattr(Image, 'Resampling', Image), 'LANCZOS')
+        pdf = pikepdf.open(self.path)
+        done = 0
+        try:
+            if max_dpi is not None:
+                objs = {o.objgen: o for o in pdf.objects if isinstance(o, pikepdf.Stream) and o.get('/Subtype') == '/Image'}
+                for ci in self.images:
+                    obj = objs.get(ci.key)
+                    if obj is None:
+                        continue
+                    try:
+                        im = self._decode(obj, ci)
+                        if im is None:
+                            continue
+                        eff = self.dpis.get(ci.key) or 200.0
+                        scale = min(1.0, float(max_dpi) / eff)
+                        if scale < 0.98:
+                            im = im.resize((max(16, int(round(im.width * scale))), max(16, int(round(im.height * scale)))), resample)
+                        gray_now = False
+                        if gray and im.mode != 'L':
+                            im = im.convert('L'); gray_now = True
+                        buf = _io.BytesIO()
+                        im.save(buf, 'JPEG', quality=int(quality), optimize=True)
+                        data = buf.getvalue()
+                        if len(data) >= ci.orig_len * 0.97:
+                            continue                      # not really smaller: keep the original picture
+                        obj.write(data, filter=Name.DCTDecode)
+                        obj.Width, obj.Height, obj.BitsPerComponent = im.width, im.height, 8
+                        if '/DecodeParms' in obj:
+                            del obj['/DecodeParms']
+                        if gray_now or im.mode == 'L':
+                            obj.ColorSpace = Name.DeviceGray
+                        elif ci.cs == '/Indexed':
+                            obj.ColorSpace = Name.DeviceRGB
+                        done += 1
+                    except Exception:
+                        continue
+            if optimize:
+                try:
+                    pdf.remove_unreferenced_resources()
+                except Exception:
+                    pass
+            if strip_meta:
+                try:
+                    for k in list(pdf.docinfo.keys()):
+                        del pdf.docinfo[k]
+                    if '/Metadata' in pdf.Root:
+                        del pdf.Root['/Metadata']
+                except Exception:
+                    pass
+            pdf.save(out_path, compress_streams=True, object_stream_mode=pikepdf.ObjectStreamMode.generate,
+                     recompress_flate=bool(optimize))
+        finally:
+            pdf.close()
+        return _os.path.getsize(out_path), done
+
+# --------------------------------------------------------- scanner mode
+def _cp_rasterize(input_path, outdir, dpi, quality, gray):
+    for f in _glob.glob(_os.path.join(outdir, 'pg-*.jpg')):
+        _os.remove(f)
+    gs = _shutil.which('gs')
+    if gs:
+        try:
+            _subprocess.run([gs, '-dNOPAUSE', '-dBATCH', '-dQUIET', '-sDEVICE=jpeg', '-r%d' % dpi, '-dJPEGQ=%d' % quality,
+                             '-dTextAlphaBits=4', '-dGraphicsAlphaBits=4',
+                             '-sColorConversionStrategy=%s' % ('Gray' if gray else 'RGB'), '-dMaxBitmap=500000000',
+                             '-sOutputFile=' + _os.path.join(outdir, 'pg-%04d.jpg'), input_path],
+                            check=True, timeout=120, capture_output=True)
+            files = sorted(_glob.glob(_os.path.join(outdir, 'pg-*.jpg')))
+            if files:
+                return files
+        except Exception:
+            pass
+    pp = _shutil.which('pdftoppm')
+    if pp:
+        cmd = [pp, '-jpeg', '-r', str(dpi), '-jpegopt', 'quality=%d' % quality] + (['-gray'] if gray else []) + [input_path, _os.path.join(outdir, 'pg')]
+        _subprocess.run(cmd, check=True, timeout=180, capture_output=True)
+        files = sorted(_glob.glob(_os.path.join(outdir, 'pg-*.jpg')), key=lambda p: int(_re.findall(r'(\d+)\.jpg$', p)[0]))
+        if files:
+            return files
+    raise RuntimeError('No page renderer available (Ghostscript or poppler needed)')
+
+def _cp_pdf_from_jpegs(jpgs, dpi, out_path):
+    import pikepdf
+    from pikepdf import Name
+    from PIL import Image
+    pdf = pikepdf.Pdf.new()
+    for f in jpgs:
+        with Image.open(f) as im:
+            w, h, mode = im.size[0], im.size[1], im.mode
+        with open(f, 'rb') as fh:
+            data = fh.read()
+        wpt, hpt = w * 72.0 / dpi, h * 72.0 / dpi
+        img = pikepdf.Stream(pdf, b'')
+        img.write(data, filter=Name.DCTDecode)
+        img.Type, img.Subtype = Name.XObject, Name.Image
+        img.Width, img.Height, img.BitsPerComponent = w, h, 8
+        img.ColorSpace = Name.DeviceGray if mode == 'L' else Name.DeviceRGB
+        page = pdf.add_blank_page(page_size=(wpt, hpt))
+        name = page.add_resource(img, Name.XObject, Name.Im0)
+        page.contents_add(pikepdf.Stream(pdf, ('q %.3f 0 0 %.3f 0 0 cm %s Do Q' % (wpt, hpt, str(name))).encode()))
+    pdf.save(out_path, compress_streams=True, object_stream_mode=pikepdf.ObjectStreamMode.generate)
+    pdf.close()
+
+def _cp_scanner_search(input_path, work, target, gray, deadline, start_dpi=110):
+    """Find the sharpest page-picture PDF that is still <= target. -> dict or None"""
+    best_ok, smallest, dpi, tries = None, None, float(start_dpi), 0
+    lo, hi = 36.0, 240.0
+    while tries < 5 and _time.time() < deadline:
+        tries += 1
+        d = int(round(max(lo, min(hi, dpi))))
+        q = max(28, min(78, int(30 + d * 0.22)))
+        try:
+            jpgs = _cp_rasterize(input_path, work, d, q, gray)
+        except Exception as e:
+            _cp_log('  raster failed: %s' % e)
+            return best_ok or smallest
+        out = _os.path.join(work, 'raster_%d.pdf' % tries)
+        _cp_pdf_from_jpegs(jpgs, d, out)
+        size = _os.path.getsize(out)
+        _cp_log('  [Scanner %d] dpi=%d q=%d -> %.1fKB' % (tries, d, q, size / 1024.0))
+        rec = {'path': out, 'size': size, 'dpi': d, 'quality': q}
+        if smallest is None or size < smallest['size']:
+            smallest = rec
+        if size <= target:
+            if best_ok is None or size > best_ok['size']:
+                best_ok = rec
+            if size >= 0.9 * target or d >= hi - 1:
+                break
+        if d <= lo + 0.5 and size > target:
+            break
+        newd = d * (float(target) / size) ** (1 / 1.7)
+        newd = max(lo, min(hi, newd * (0.97 if size > target else 1.0)))
+        if abs(newd - d) < 2:
+            break
+        dpi = newd
+    return best_ok or smallest
+
+# ------------------------------------------------------------ entry
+def compress_pdf_file(input_path, output_path, work_dir, mode='preset', preset='recommended', target_bytes=0,
+                      dpi=None, quality=None, grayscale=False, allow_raster=True, optimize=True, strip_meta=False,
+                      time_budget=70.0):
+    t0 = _time.time()
+    deadline = t0 + float(time_budget)
+    orig = _os.path.getsize(input_path)
+    import pikepdf
+    try:
+        ws = _CpWorkspace(input_path, deadline)
+    except pikepdf.PasswordError:
+        raise ValueError('This PDF is password protected. Please remove the password first.')
+    except Exception:
+        raise ValueError('Could not read this PDF. The file may be damaged.')
+    rep = {'original': orig, 'images_total': ws.total_images, 'images_candidates': len(ws.images), 'image_bytes': ws.image_bytes,
+           'text_preserved': True, 'attempts': 0, 'dpi': 0, 'quality': 0, 'status': 'none', 'method': '', 'min_vector': 0}
+    cands = []                                   # (size, path, info)
+    def run(tag, **kw):
+        p = _os.path.join(work_dir, 'c_%d.pdf' % (len(cands) + 1))
+        size, n = ws.trial(p, optimize=optimize, strip_meta=strip_meta, **kw)
+        rep['attempts'] += 1
+        _cp_log('  [%s] dpi=%s q=%s -> %.1fKB (%d images)' % (tag, kw.get('max_dpi'), kw.get('quality'), size / 1024.0, n))
+        cands.append((size, p, {'dpi': kw.get('max_dpi') or 0, 'quality': kw.get('quality') or 0, 'images': n}))
+        return size, p, n
+
+    target = int(target_bytes or 0)
+    if target and target < _CP_MIN_TARGET:
+        target = _CP_MIN_TARGET
+    chosen = None
+    if mode == 'target' and target > 0:
+        if target >= orig:
+            rep['status'] = 'bigger'
+            s0, p0, _ = run('lossless')
+            chosen = ('Lossless clean-up', p0, 0, 0, 0)
+        else:
+            s0, p0, _ = run('lossless')
+            if s0 <= target:
+                rep['status'] = 'hit'
+                chosen = ('Lossless clean-up', p0, 0, 0, 0)
+            else:
+                ladder = _cp_ladder(max_dpi=dpi or 300, max_q=quality or 92)
+                if not ws.images:
+                    rep['min_vector'] = s0
+                else:
+                    last = len(ladder) - 1
+                    sf, pf, nf = run('floor', max_dpi=ladder[last][0], quality=ladder[last][1], gray=grayscale)
+                    rep['min_vector'] = min(s0, sf)
+                    if sf <= target:
+                        lo, hi, best_i = -1, last, last          # ladder[hi] is known to fit, ladder[lo] is too big
+                        best_path, best_size, best_dq = pf, sf, ladder[last]
+                        while hi - lo > 1 and _time.time() < deadline:
+                            mid = (lo + hi) // 2 if lo >= 0 else hi // 2
+                            sm, pm, nm = run('step %d' % mid, max_dpi=ladder[mid][0], quality=ladder[mid][1], gray=grayscale)
+                            if sm <= target:
+                                hi, best_path, best_size, best_dq = mid, pm, sm, ladder[mid]
+                            else:
+                                lo = mid
+                        if lo >= 0:                                # fine-tune between the two neighbouring steps
+                            a, b = ladder[lo], ladder[hi]
+                            f_lo, f_hi = 0.0, 1.0
+                            for _ in range(3):
+                                if _time.time() > deadline:
+                                    break
+                                f = (f_lo + f_hi) / 2.0
+                                d_ = int(round(a[0] + (b[0] - a[0]) * f)); q_ = int(round(a[1] + (b[1] - a[1]) * f))
+                                sm, pm, nm = run('fine %.2f' % f, max_dpi=d_, quality=q_, gray=grayscale)
+                                if sm <= target:
+                                    f_hi = f
+                                    if sm > best_size:
+                                        best_path, best_size, best_dq = pm, sm, (d_, q_)
+                                else:
+                                    f_lo = f
+                        chosen = ('Smart image compression', best_path, best_dq[0], best_dq[1], 0)
+                        rep['status'] = 'hit'
+                    else:
+                        chosen = None
+                if chosen is None:
+                    # vector mode cannot reach the target
+                    if allow_raster:
+                        _cp_log('Scanner mode needed (vector floor %.1fKB > target %.1fKB)' % (rep['min_vector'] / 1024.0, target / 1024.0))
+                        r = _cp_scanner_search(input_path, work_dir, target, grayscale, deadline)
+                        if r:
+                            rep['attempts'] += 1
+                            floor_size = rep['min_vector'] or min(c[0] for c in cands)
+                            if r['size'] <= target or r['size'] < 0.85 * floor_size:     # otherwise keep the real text
+                                rep['text_preserved'] = False
+                                rep['status'] = 'hit' if r['size'] <= target else 'closest'
+                                chosen = ('Scanner mode (pages become pictures)', r['path'], r['dpi'], r['quality'], 0)
+                    if chosen is None:
+                        best = min(cands, key=lambda c: c[0])
+                        rep['status'] = 'closest'
+                        chosen = ('Smart image compression (closest possible)', best[1], best[2]['dpi'], best[2]['quality'], 0)
+    else:
+        if preset == 'custom':
+            d, q = int(dpi or 100), int(quality or 70)
+        else:
+            d, q = _CP_PRESETS.get(preset, _CP_PRESETS['recommended'])
+        if dpi and preset != 'custom':
+            d = min(d, int(dpi))
+        if quality and preset != 'custom':
+            q = min(q, int(quality))
+        s, p, n = run('preset %s' % preset, max_dpi=d, quality=q, gray=grayscale)
+        chosen = ('Preset: %s' % preset, p, d, q, n)
+        rep['status'] = 'done'
+
+    method, path, d, q, _ = chosen
+    size = _os.path.getsize(path)
+    # never hand back something bigger than what the user uploaded
+    small = min(cands, key=lambda c: c[0]) if cands else None
+    if size >= orig:
+        if small and small[0] < orig:
+            method, path, size = 'Lossless clean-up', small[1], small[0]
+            rep['text_preserved'] = True
+        else:
+            method, path, size = 'Already optimized', input_path, orig
+            rep['status'] = 'already'
+            rep['text_preserved'] = True
+    rep['images_recompressed'] = next((c[2]['images'] for c in cands if c[1] == path), 0)
+    _shutil.copyfile(path, output_path)
+    rep.update({'final': size, 'method': method, 'dpi': d, 'quality': q, 'seconds': round(_time.time() - t0, 1)})
+    if rep['status'] == 'done' and size >= orig * 0.98:
+        rep['status'] = 'already'
+    return rep
+
+
+# ========== 1. COMPRESS PDF (SMART: lossless -> image recompression -> scanner mode) ==========
 @app.route('/compress', methods=['POST'])
 def compress():
     if not processing_lock.acquire(timeout=300):
@@ -205,194 +657,59 @@ def compress():
         valid, msg = validate_file(file, allowed_ext=['.pdf'], max_size=20 * 1024 * 1024)
         if not valid:
             return msg, 400
-
         input_path = os.path.join(temp_dir, 'input.pdf')
-        file.save(input_path)
-        input_size = os.path.getsize(input_path)
-
-        preset = request.form.get('preset', 'extreme')
-        target_bytes = request.form.get('target_bytes', '').strip()
-        grayscale = request.form.get('grayscale', 'no') == 'yes'
-        
-        try:
-            target_size = int(target_bytes) if target_bytes else 0
-        except:
-            target_size = 0
-
-        MIN_TARGET = 10 * 1024 
-        if target_size > 0 and target_size < MIN_TARGET:
-            target_size = MIN_TARGET
-
         output_path = os.path.join(temp_dir, 'output.pdf')
-        method_used = "Standard"
-        target_hit = ""
+        file.save(input_path)
 
-        def build_gs_cmd(inp, outp, dpi_val, jpeg_quality, pdf_settings, gray=False):
-            cmd = ['gs', '-sDEVICE=pdfwrite', '-dCompatibilityLevel=1.4', f'-dPDFSETTINGS={pdf_settings}', '-dNOPAUSE', '-dQUIET', '-dBATCH', '-dNOINTERPOLATE', '-dDetectDuplicateImages=true', '-dDownsampleColorImages=true', f'-dColorImageResolution={dpi_val}', '-dDownsampleGrayImages=true', f'-dGrayImageResolution={dpi_val}', '-dDownsampleMonoImages=true', f'-dMonoImageResolution={dpi_val}', f'-dJPEGQ={jpeg_quality}', '-dAutoRotatePages=/None', '-dMaxBitmap=500000000']
-            if grayscale or gray:
-                cmd.extend(['-sColorConversionStrategy=Gray', '-dProcessColorModel=/DeviceGray'])
-            cmd.extend([f'-sOutputFile={outp}', inp])
-            return cmd
-
-        def fallback_compression(inp, outp):
+        def to_int(name, default=0):
             try:
-                from PyPDF2 import PdfReader, PdfWriter
-                print("⚠️ Ghostscript failed or timed out. Activating PyPDF2 Fallback...", flush=True)
-                reader = PdfReader(inp)
-                writer = PdfWriter()
-                for page in reader.pages:
-                    writer.add_page(page)
-                writer.compress_identical_objects()
-                with open(outp, 'wb') as f:
-                    writer.write(f)
-                return True
-            except Exception as e:
-                print(f"❌ PyPDF2 Fallback also failed: {e}", flush=True)
-                return False
+                return int(float((request.form.get(name, '') or '').strip()))
+            except (ValueError, TypeError):
+                return default
 
-        if target_size > 0 and target_size < input_size:
-            print(f'🎯 Target: {target_size/1024:.1f}KB (Original: {input_size/1024:.1f}KB)', flush=True)
-            
-            if target_size < (input_size * 0.25):
-                print("⚡ Extreme size detected. Activating AI Scanner Mode...", flush=True)
-                min_dpi, max_dpi = 10, 50
-                attempts = 0
-                jpg_files = []
-                raster_path = None
-                
-                while attempts < 4:
-                    attempts += 1
-                    current_dpi = (min_dpi + max_dpi) // 2
-                    
-                    for f in glob.glob(f'{temp_dir}/page-*.jpg'): os.remove(f)
-                    
-                    jpg_pattern = f'{temp_dir}/page-%03d.jpg'
-                    color_strategy = '-sColorConversionStrategy=Gray' if grayscale else '-sColorConversionStrategy=RGB'
-                    
-                    try:
-                        subprocess.run([
-                            'gs', '-dNOPAUSE', '-dBATCH', '-dQUIET', '-sDEVICE=jpeg', 
-                            f'-r{current_dpi}', '-dJPEGQ=30', color_strategy, '-dMaxBitmap=500000000',
-                            f'-sOutputFile={jpg_pattern}', input_path
-                        ], check=True, timeout=ATTEMPT_TIMEOUT, capture_output=True)
-                    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
-                        print(f"  ⚠️ Ghostscript Rasterize failed/timed out. Trying fallback...", flush=True)
-                        if fallback_compression(input_path, output_path):
-                            target_hit = f'Fallback ({os.path.getsize(output_path)/1024:.1f}KB)'
-                            method_used = "PyPDF2 Fallback"
-                            break
-                        else:
-                            return 'This PDF is too complex to compress. Please try a smaller file.', 400
-                    
-                    jpg_files = sorted(glob.glob(jpg_pattern))
-                    if not jpg_files: break
-                    
-                    raster_path = os.path.join(temp_dir, f'raster_{attempts}.pdf')
-                    try:
-                        subprocess.run([
-                            'gs', '-sDEVICE=pdfwrite', '-dCompatibilityLevel=1.4', 
-                            '-dNOPAUSE', '-dQUIET', '-dBATCH', '-dMaxBitmap=500000000',
-                            f'-sOutputFile={raster_path}'
-                        ] + jpg_files, check=True, timeout=ATTEMPT_TIMEOUT, capture_output=True)
-                    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
-                        print(f"  ⚠️ Ghostscript Merge failed/timed out. Trying fallback...", flush=True)
-                        if fallback_compression(input_path, output_path):
-                            target_hit = f'Fallback ({os.path.getsize(output_path)/1024:.1f}KB)'
-                            method_used = "PyPDF2 Fallback"
-                            break
-                        else:
-                            return 'This PDF is too complex to compress. Please try a smaller file.', 400
+        target_bytes = to_int('target_bytes', 0)
+        preset = (request.form.get('preset', 'recommended') or 'recommended').lower()
+        if preset not in ('extreme', 'recommended', 'high', 'custom'):
+            preset = 'recommended'
+        dpi = to_int('dpi', 0) or None
+        quality = to_int('quality', 0) or None
+        if dpi:
+            dpi = max(36, min(600, dpi))
+        if quality:
+            quality = max(10, min(98, quality))
+        try:
+            rep = compress_pdf_file(
+                input_path, output_path, temp_dir,
+                mode='target' if target_bytes > 0 else 'preset', preset=preset, target_bytes=target_bytes,
+                dpi=dpi, quality=quality,
+                grayscale=_flag(request.form.get('grayscale'), False),
+                allow_raster=_flag(request.form.get('allow_raster'), True),
+                optimize=_flag(request.form.get('optimize'), True),
+                strip_meta=_flag(request.form.get('strip_meta'), False),
+                time_budget=60.0,
+            )
+        except ValueError as e:
+            return str(e), 400
 
-                    if os.path.exists(raster_path):
-                        out_size = os.path.getsize(raster_path)
-                        print(f'  [Scanner Mode {attempts}] DPI:{current_dpi} -> {out_size/1024:.1f}KB', flush=True)
-                        
-                        if out_size <= target_size:
-                            shutil.copy(raster_path, output_path)
-                            target_hit = f'Exact Hit ({out_size/1024:.1f}KB)'
-                            method_used = "AI Extreme Scanner"
-                            break
-                        else:
-                            max_dpi = current_dpi - 2 
-                            
-                if not os.path.exists(output_path) and raster_path and os.path.exists(raster_path):
-                    shutil.copy(raster_path, output_path)
-                    target_hit = f'Closest ({os.path.getsize(output_path)/1024:.1f}KB)'
-                    method_used = "AI Scanner (Limit)"
-
-            else:
-                print("🔧 Applying Standard Text-Safe Compression...", flush=True)
-                min_dpi, max_dpi = 20, 150
-                attempts = 0
-                attempt_path = None
-                
-                while attempts < 3:
-                    attempts += 1
-                    mid_dpi = (min_dpi + max_dpi) // 2
-                    mid_quality = max(10, min(80, int((mid_dpi / 150) * 70) + 10))
-                    attempt_path = os.path.join(temp_dir, f'attempt_{attempts}.pdf')
-                    
-                    cmd = build_gs_cmd(input_path, attempt_path, mid_dpi, mid_quality, '/screen')
-                    
-                    try:
-                        subprocess.run(cmd, check=True, timeout=ATTEMPT_TIMEOUT, capture_output=True)
-                    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
-                        print(f"  ⚠️ Ghostscript Standard failed/timed out. Trying fallback...", flush=True)
-                        if fallback_compression(input_path, output_path):
-                            target_hit = f'Fallback ({os.path.getsize(output_path)/1024:.1f}KB)'
-                            method_used = "PyPDF2 Fallback"
-                            break
-                        else:
-                            return 'This PDF is too complex to compress. Please try a smaller file.', 400
-                    
-                    if os.path.exists(attempt_path):
-                        out_size = os.path.getsize(attempt_path)
-                        print(f'  [Standard Mode] DPI:{mid_dpi} -> {out_size/1024:.1f}KB', flush=True)
-                        
-                        if out_size <= target_size:
-                            shutil.copy(attempt_path, output_path)
-                            target_hit = f'Exact Hit ({out_size/1024:.1f}KB)'
-                            method_used = "Smart Text-Safe"
-                            break
-                        else:
-                            max_dpi = mid_dpi - 5
-                            
-                if not os.path.exists(output_path) and attempt_path and os.path.exists(attempt_path):
-                    shutil.copy(attempt_path, output_path)
-                    target_hit = f'Closest ({os.path.getsize(output_path)/1024:.1f}KB)'
-                    method_used = "Smart Text-Safe (Limit)"
-
-        else:
-            cmd = build_gs_cmd(input_path, output_path, 72, 50, '/screen')
-            try:
-                subprocess.run(cmd, check=True, timeout=ATTEMPT_TIMEOUT, capture_output=True)
-                method_used = "Normal Compress"
-                target_hit = f"Done ({os.path.getsize(output_path)/1024:.1f}KB)"
-            except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
-                print(f"⚠️ Ghostscript Normal failed/timed out. Trying fallback...", flush=True)
-                if fallback_compression(input_path, output_path):
-                    method_used = "PyPDF2 Fallback"
-                    target_hit = f"Fallback ({os.path.getsize(output_path)/1024:.1f}KB)"
-
-        if not os.path.exists(output_path):
-            print("🚨 Ultimate Fallback Activated: Output file missing.", flush=True)
-            if fallback_compression(input_path, output_path):
-                method_used = "Fallback Standard"
-                target_hit = "Best Effort"
-            else:
-                return 'Compression failed: Could not generate output file.', 500
-
-        if not os.path.exists(output_path):
-            return 'Compression failed: Could not generate output file.', 500
-
-        output_size = os.path.getsize(output_path)
-        
+        kb = lambda n: '%.1fKB' % (n / 1024.0)
+        hit_text = {'hit': 'Target reached (%s)' % kb(rep['final']), 'closest': 'Closest possible (%s)' % kb(rep['final']),
+                    'bigger': 'Target is bigger than the file', 'already': 'Already optimized', 'done': 'Done (%s)' % kb(rep['final'])}.get(rep['status'], kb(rep['final']))
         response = send_file(output_path, mimetype='application/pdf', as_attachment=True, download_name='compressed.pdf')
-        response.headers['X-Compression-Method'] = method_used
-        response.headers['X-Target-Hit'] = target_hit
-        response.headers['X-Original-Size'] = str(input_size)
-        response.headers['X-Final-Size'] = str(output_size)
-        response.headers['Access-Control-Expose-Headers'] = 'X-Compression-Method, X-Target-Hit, X-Original-Size, X-Final-Size'
+        h = response.headers
+        h['X-Compression-Method'] = rep['method']
+        h['X-Target-Hit'] = hit_text
+        h['X-Target-Status'] = rep['status']
+        h['X-Original-Size'] = str(rep['original'])
+        h['X-Final-Size'] = str(rep['final'])
+        h['X-Text-Preserved'] = 'yes' if rep['text_preserved'] else 'no'
+        h['X-Images'] = '%d/%d' % (rep.get('images_recompressed', 0), rep['images_total'])
+        h['X-Dpi'] = str(rep['dpi'])
+        h['X-Quality'] = str(rep['quality'])
+        h['X-Min-Vector'] = str(rep.get('min_vector', 0))
+        h['X-Attempts'] = str(rep['attempts'])
+        h['X-Seconds'] = str(rep.get('seconds', 0))
+        h['Access-Control-Expose-Headers'] = ', '.join(['X-Compression-Method', 'X-Target-Hit', 'X-Target-Status', 'X-Original-Size', 'X-Final-Size',
+                                                         'X-Text-Preserved', 'X-Images', 'X-Dpi', 'X-Quality', 'X-Min-Vector', 'X-Attempts', 'X-Seconds'])
         return response
     except Exception as e:
         import traceback
