@@ -2237,7 +2237,7 @@ def _px_split_segments(words, gap_thr):
         out.append(_PxSeg(grp[0]['x0'], grp[-1]['x1'], ' '.join(w['text'] for w in grp), bold_chars * 2 >= chars))
     return out
 
-def _px_words_to_lines(words):
+def _px_words_to_lines(words, gap_k=0.55, gap_min=4.8):
     lines = []
     for w in sorted(words, key=lambda w: (w['top'], w['x0'])):
         mid = (w['top'] + w['bottom']) / 2.0
@@ -2252,7 +2252,7 @@ def _px_words_to_lines(words):
     for ln in lines:
         l = _PxLine()
         l.top, l.bottom, l.size = ln['top'], ln['bottom'], ln['size']
-        l.segs = _px_split_segments(ln['words'], max(4.8, 0.55 * ln['size']))
+        l.segs = _px_split_segments(ln['words'], max(gap_min, gap_k * ln['size']))
         out.append(l)
     return out
 
@@ -2385,16 +2385,17 @@ def _px_layout(items, page_w, tol):
         else:
             flush()
             top, bottom, tbl = it[1], it[2], it[3]
+            tbl_merges = it[4] if len(it) > 4 else []
             blank = prev_bottom is not None and (top - prev_bottom) > 0.7 * prev_size
             for ri, r in enumerate(tbl):
                 rows.append({'cells': {j: (c, ri == 0) for j, c in enumerate(r) if c != ''}, 'merges': [], 'kind': 'table',
-                             'hdr': ri == 0, 'blank': blank and ri == 0, 'size': 10.0})
+                             'hdr': ri == 0, 'blank': blank and ri == 0, 'size': 10.0, 'tbl_merges': tbl_merges if ri == 0 else None})
             prev_bottom, prev_size = bottom, 10.0
     flush()
     return rows
 
 # --------------------------------------------------------------- writing
-def _px_write(ws, rows, numbers, start_row=1):
+def _px_write(ws, rows, numbers, start_row=1, wrap=False):
     from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
     from openpyxl.utils import get_column_letter
     thin = Side(style='thin', color='BFC5D2')
@@ -2403,11 +2404,14 @@ def _px_write(ws, rows, numbers, start_row=1):
     sizes = [r['size'] for r in rows if r['kind'] != 'table'] or [10.0]
     body = _stats.median(sizes)
     widths, r = {}, start_row
+    pending = []
     grid_rows = [x for x in rows if x['kind'] in ('grid', 'table')]
     for row in rows:
         if row['blank']:
             r += 1
         ncell = len(row['cells'])
+        if row.get('tbl_merges'):
+            pending.extend((r + a, b, r + c, d) for (a, b, c, d) in row['tbl_merges'])
         for col, (text, bold) in row['cells'].items():
             val, fmt = _px_value(text, numbers)
             c = ws.cell(row=r, column=col + 1, value=val)
@@ -2418,7 +2422,7 @@ def _px_write(ws, rows, numbers, start_row=1):
                 c.font = Font(bold=True, size=14 if big else 11)
             if row['kind'] == 'table' or (row['kind'] == 'grid' and ncell >= 2):
                 c.border = border
-                c.alignment = Alignment(vertical='top', wrap_text=False)
+                c.alignment = Alignment(vertical='center' if wrap else 'top', wrap_text=bool(wrap))
             if row['hdr'] and row['kind'] in ('table', 'grid'):
                 c.fill = fill_hdr
             if row['kind'] != 'text':
@@ -2426,6 +2430,16 @@ def _px_write(ws, rows, numbers, start_row=1):
         for c1, c2 in row['merges']:
             ws.merge_cells(start_row=r, start_column=c1 + 1, end_row=r, end_column=c2 + 1)
         r += 1
+    for (r1, c1, r2, c2) in pending:
+        try:
+            ws.merge_cells(start_row=r1, start_column=c1 + 1, end_row=r2, end_column=c2 + 1)
+            hdr_fill = ws.cell(row=r1, column=c1 + 1).fill
+            for rr in range(r1, r2 + 1):
+                for cc in range(c1 + 1, c2 + 2):
+                    cell = ws.cell(row=rr, column=cc); cell.border = border
+            ws.cell(row=r1, column=c1 + 1).alignment = Alignment(vertical='center', horizontal='center' if c2 > c1 else None, wrap_text=True)
+        except Exception:
+            pass
     for col, n in widths.items():
         ws.column_dimensions[get_column_letter(col + 1)].width = max(9, min(55, n * 1.12 + 2))
     if 0 not in widths:
@@ -3263,122 +3277,558 @@ Rules:
         processing_lock.release()
         cleanup_dir(temp_dir)
 
-# ========== 22. IMAGE TO EXCEL ==========
+# ======================================================================
+#  IMAGE -> EXCEL ENGINE (uses the layout helpers above)
+# ======================================================================
+#  IMAGE -> EXCEL ENGINE  (BharatOS-Tools)  - no AI service needed
+#  1. clean the photo (orientation, size, tilt)
+#  2. find real table borders with OpenCV  -> exact rows x columns,
+#     merged cells included
+#  3. read every word with Tesseract OCR (+ box positions)
+#  4. put each word into the cell it sits in (borderless pages are laid
+#     out from word positions, like PDF -> Excel)
+# ======================================================================
+import io as _io
+import re as _re
+import os as _os
+
+_IX_NOISE = _re.compile(r'^[|_\-\u2014\u2013=~\'`\u2018\u2019\u201c\u201d.,:;\\/]{1,3}$')
+
+def _ix_langs(lang):
+    import pytesseract
+    try:
+        have = set(pytesseract.get_languages(config=''))
+    except Exception:
+        have = {'eng'}
+    if lang and lang not in ('auto', ''):
+        parts = [p for p in lang.split('+') if p in have]
+        if parts:
+            return '+'.join(parts)
+    return 'eng+hin' if 'hin' in have else 'eng'
+
+def _ix_load(path):
+    import numpy as np
+    from PIL import Image, ImageOps
+    im = Image.open(path)
+    try:
+        im = ImageOps.exif_transpose(im)
+    except Exception:
+        pass
+    if im.mode in ('RGBA', 'LA', 'P'):
+        im = im.convert('RGBA'); bg = Image.new('RGBA', im.size, (255, 255, 255, 255)); bg.alpha_composite(im); im = bg
+    im = im.convert('L')
+    w, h = im.size
+    long_side = max(w, h)
+    if long_side < 1800:                       # small screenshots: enlarge so small text becomes readable
+        f = min(3.0, 2000.0 / long_side)
+        im = im.resize((int(w * f), int(h * f)), Image.LANCZOS)
+    elif long_side > 4200:
+        f = 4200.0 / long_side
+        im = im.resize((int(w * f), int(h * f)), Image.LANCZOS)
+    return np.array(im)
+
+def _ix_orient(gray):
+    """Tesseract orientation detection: fixes sideways / upside-down pictures"""
+    import cv2, numpy as np, pytesseract
+    h, w = gray.shape
+    sc = min(1.0, 1400.0 / max(h, w))
+    small = cv2.resize(gray, (int(w * sc), int(h * sc)), interpolation=cv2.INTER_AREA) if sc < 1 else gray
+    try:
+        osd = pytesseract.image_to_osd(small, config='--psm 0', output_type=pytesseract.Output.DICT, timeout=30)
+        rot, conf = int(osd.get('rotate', 0)), float(osd.get('orientation_conf', 0))
+    except Exception:
+        return gray, 0
+    if rot in (90, 180, 270) and conf >= 4.0:
+        k = {90: cv2.ROTATE_90_CLOCKWISE, 180: cv2.ROTATE_180, 270: cv2.ROTATE_90_COUNTERCLOCKWISE}[rot]
+        return cv2.rotate(gray, k), rot
+    return gray, 0
+
+def _ix_deskew(gray):
+    import cv2, numpy as np
+    h, w = gray.shape
+    sc = min(1.0, 700.0 / max(h, w))
+    small = cv2.resize(gray, (max(1, int(w * sc)), max(1, int(h * sc))), interpolation=cv2.INTER_AREA) if sc < 1 else gray.copy()
+    _, bw = cv2.threshold(small, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    sh, sw = bw.shape
+    def score(a):
+        M = cv2.getRotationMatrix2D((sw / 2.0, sh / 2.0), a, 1.0)
+        r = cv2.warpAffine(bw, M, (sw, sh), flags=cv2.INTER_NEAREST)
+        return float(np.var(r.sum(axis=1).astype('float64')))
+    best_a, best_s = 0.0, score(0.0)
+    for a in np.arange(-6.0, 6.01, 0.5):
+        s = score(float(a))
+        if s > best_s * 1.01:
+            best_a, best_s = float(a), s
+    for a in np.arange(best_a - 0.5, best_a + 0.51, 0.1):
+        s = score(float(a))
+        if s > best_s:
+            best_a, best_s = float(a), s
+    if abs(best_a) < 0.3:
+        return gray, 0.0
+    M = cv2.getRotationMatrix2D((w / 2.0, h / 2.0), best_a, 1.0)
+    return cv2.warpAffine(gray, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_CONSTANT, borderValue=255), best_a
+
+# ------------------------------------------------------------ grid
+def _ix_runs(profile, thr):
+    """indices where profile>=thr grouped in runs -> list of centres"""
+    out, start = [], None
+    for i, v in enumerate(profile):
+        if v >= thr and start is None:
+            start = i
+        elif v < thr and start is not None:
+            out.append((start + i - 1) / 2.0); start = None
+    if start is not None:
+        out.append((start + len(profile) - 1) / 2.0)
+    return out
+
+def _ix_find_tables(gray):
+    """-> (list of table dicts, line_mask)"""
+    import cv2, numpy as np
+    h, w = gray.shape
+    # large dark fills (e.g. a dark header): flip them, so light lines on dark become dark lines on light
+    big_dark = cv2.morphologyEx((gray < 110).astype('uint8') * 255, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15)))
+    flipped = gray.copy()
+    flipped[big_dark > 0] = 255 - flipped[big_dark > 0]
+    T = max(9, int(min(h, w) * 0.009))                   # lines are thin; filled bands / big letters are thicker
+    bh_h = cv2.morphologyEx(flipped, cv2.MORPH_BLACKHAT, cv2.getStructuringElement(cv2.MORPH_RECT, (1, T)))
+    bh_v = cv2.morphologyEx(flipped, cv2.MORPH_BLACKHAT, cv2.getStructuringElement(cv2.MORPH_RECT, (T, 1)))
+    hbw = cv2.threshold(bh_h, 40, 255, cv2.THRESH_BINARY)[1]
+    vbw = cv2.threshold(bh_v, 40, 255, cv2.THRESH_BINARY)[1]
+    hk, vk = max(30, w // 28), max(30, h // 28)
+    horiz = cv2.morphologyEx(hbw, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (hk, 1)))
+    vert = cv2.morphologyEx(vbw, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (1, vk)))
+    horiz = cv2.morphologyEx(horiz, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (max(3, hk // 2), 1)))
+    vert = cv2.morphologyEx(vert, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(3, vk // 2))))
+    mask = cv2.bitwise_or(horiz, vert)
+    grown = cv2.dilate(mask, cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5)), iterations=2)
+    n, lab, stats, _ = cv2.connectedComponentsWithStats(grown, connectivity=8)
+    tables = []
+    for i in range(1, n):
+        x, y, bwid, bh, area = stats[i]
+        if bwid < 0.12 * w or bh < 0.04 * h:
+            continue
+        sub_h = horiz[y:y + bh, x:x + bwid] > 0
+        sub_v = vert[y:y + bh, x:x + bwid] > 0
+        hl = [y + c for c in _ix_runs(sub_h.sum(axis=1), 0.30 * bwid)]
+        vl = [x + c for c in _ix_runs(sub_v.sum(axis=0), 0.30 * bh)]
+        # outer edges may not be drawn: use the table box
+        if not hl or hl[0] > y + 0.06 * bh: hl = [float(y)] + hl
+        if not hl or hl[-1] < y + 0.94 * bh: hl = hl + [float(y + bh)]
+        if not vl or vl[0] > x + 0.06 * bwid: vl = [float(x)] + vl
+        if not vl or vl[-1] < x + 0.94 * bwid: vl = vl + [float(x + bwid)]
+        if len(hl) < 3 or len(vl) < 3:
+            continue
+        tables.append({'x0': x, 'y0': y, 'x1': x + bwid, 'y1': y + bh, 'hl': hl, 'vl': vl})
+    tables.sort(key=lambda t: t['y0'])
+    return tables, horiz, vert, mask
+
+def _ix_merge_cells(t, horiz, vert):
+    """union-find over the grid cells: no border between two cells -> same (merged) cell"""
+    hl, vl = t['hl'], t['vl']
+    R, C = len(hl) - 1, len(vl) - 1
+    parent = list(range(R * C))
+    def find(a):
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]; a = parent[a]
+        return a
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+    def cov(mask, xs, ys, vertical):
+        x0, x1 = int(xs[0]), int(xs[1]); y0, y1 = int(ys[0]), int(ys[1])
+        sub = mask[max(0, y0):y1, max(0, x0):x1]
+        if sub.size == 0:
+            return 1.0
+        return float((sub.max(axis=1 if vertical else 0) > 0).mean())
+    for r in range(R):
+        for c in range(C):
+            if c + 1 < C:        # border between (r,c) and (r,c+1)
+                x = vl[c + 1]
+                if cov(vert, (x - 3, x + 4), (hl[r] + 4, hl[r + 1] - 3), True) < 0.30:
+                    union(r * C + c, r * C + c + 1)
+            if r + 1 < R:        # border between (r,c) and (r+1,c)
+                y = hl[r + 1]
+                if cov(horiz, (vl[c] + 4, vl[c + 1] - 3), (y - 3, y + 4), False) < 0.30:
+                    union(r * C + c, (r + 1) * C + c)
+    groups = {}
+    for r in range(R):
+        for c in range(C):
+            groups.setdefault(find(r * C + c), []).append((r, c))
+    master = {}
+    merges = []
+    for cells in groups.values():
+        rs = [a for a, _ in cells]; cs = [b for _, b in cells]
+        r1, r2, c1, c2 = min(rs), max(rs), min(cs), max(cs)
+        if len(cells) > 1 and len(cells) == (r2 - r1 + 1) * (c2 - c1 + 1):      # only clean rectangles
+            merges.append((r1, c1, r2, c2))
+            for (r, c) in cells:
+                master[(r, c)] = (r1, c1)
+        else:
+            for (r, c) in cells:
+                master[(r, c)] = (r, c)
+    return master, merges
+
+# ------------------------------------------------------------- OCR
+def _ix_ocr_words(img, lang, psm=6, whitelist=None, dx=0, dy=0, sc=1.0):
+    import pytesseract
+    cfg = '--oem 1 --psm %d' % psm + ((' -c tessedit_char_whitelist=' + whitelist) if whitelist else '')
+    d = pytesseract.image_to_data(img, lang=lang, config=cfg, output_type=pytesseract.Output.DICT, timeout=120)
+    words = []
+    for i in range(len(d['text'])):
+        t = (d['text'][i] or '').strip()
+        try:
+            conf = float(d['conf'][i])
+        except Exception:
+            conf = -1
+        if not t or conf < 5:
+            continue
+        if _IX_NOISE.match(t) and conf < 80:
+            continue
+        x, y, w, h = d['left'][i], d['top'][i], d['width'][i], d['height'][i]
+        words.append({'text': t, 'x0': x / sc + dx, 'x1': (x + w) / sc + dx, 'top': y / sc + dy, 'bottom': (y + h) / sc + dy, 'size': h / sc, 'conf': conf, 'bold': False})
+    return words
+
+def _ix_reocr_cell(gray, box, lang, digits=False):
+    """read ONE cell again (bigger, black on white) -> (text, average confidence)"""
+    import cv2, numpy as np
+    x0, y0, x1, y1 = [int(v) for v in box]
+    crop = gray[max(0, y0):y1, max(0, x0):x1]
+    if crop.size == 0 or crop.shape[0] < 8 or crop.shape[1] < 8:
+        return '', 0.0
+    if crop.mean() < 120:
+        crop = 255 - crop
+    bg = int(np.median(crop))
+    crop = cv2.copyMakeBorder(crop, 12, 12, 12, 12, cv2.BORDER_CONSTANT, value=bg)
+    if crop.shape[0] < 90:
+        f = 90.0 / crop.shape[0]; crop = cv2.resize(crop, (int(crop.shape[1] * f), 90), interpolation=cv2.INTER_CUBIC)
+    else:
+        f = 1.0
+    ws = _ix_ocr_words(crop, lang, psm=7 if (y1 - y0) < 70 else 6, whitelist='0123456789.,-()%' if digits else None)
+    if not ws:
+        return '', 0.0
+    return _ix_cell_text(ws), sum(w['conf'] for w in ws) / len(ws)
+
+def _ix_cell_text(ws):
+    """words of one cell -> text (lines top to bottom, words left to right)"""
+    if not ws:
+        return ''
+    med = sorted(w['size'] for w in ws)[len(ws) // 2] or 10.0
+    lines = []
+    for w in sorted(ws, key=lambda w: (w['top'] + w['bottom']) / 2.0):
+        mid = (w['top'] + w['bottom']) / 2.0
+        if lines and abs(mid - lines[-1]['mid']) < 0.6 * med:
+            lines[-1]['w'].append(w)
+        else:
+            lines.append({'mid': mid, 'w': [w]})
+    return ' '.join(' '.join(x['text'] for x in sorted(l['w'], key=lambda x: x['x0'])) for l in lines)
+
+
+_IX_NUMLIKE = _re.compile(r'^[\d,.\-()%\s]+$')
+
+def _ix_strip_ocr(img, box, lang, psm=6, whitelist=None, pad=14):
+    import cv2, numpy as np
+    x0, y0, x1, y1 = [int(v) for v in box]
+    x0, y0 = max(0, x0), max(0, y0)
+    crop = img[y0:y1, x0:x1]
+    if crop.size == 0 or crop.shape[0] < 6 or crop.shape[1] < 6:
+        return []
+    if (crop < 150).mean() < 0.003:                 # nothing but white
+        return []
+    sc = 2.0 if crop.shape[1] < 400 and crop.shape[0] < 3000 else 1.0
+    if sc > 1:
+        crop = cv2.resize(crop, (int(crop.shape[1] * sc), int(crop.shape[0] * sc)), interpolation=cv2.INTER_CUBIC)
+    p = int(pad * sc)
+    crop = cv2.copyMakeBorder(crop, p, p, p, p, cv2.BORDER_CONSTANT, value=255)
+    return _ix_ocr_words(crop, lang, psm=psm, whitelist=whitelist, dx=x0 - pad, dy=y0 - pad, sc=sc)
+
+def _ix_table_words(clean, gray, t, master, merges, lang):
+    """OCR a bordered table column by column (+ merged areas on their own) -> list of words"""
+    import numpy as np
+    hl, vl = t['hl'], t['vl']
+    R, C = len(hl) - 1, len(vl) - 1
+    work = clean.copy()
+    boxes = {}
+    for (r, c), m in master.items():
+        if m != (r, c):
+            continue
+        r2 = max(rr for (rr, cc), mm in master.items() if mm == m); c2 = max(cc for (rr, cc), mm in master.items() if mm == m)
+        boxes[m] = (int(vl[c] + 3), int(hl[r] + 3), int(vl[c2 + 1] - 2), int(hl[r2 + 1] - 2), r2, c2)
+    for m, (bx0, by0, bx1, by1, r2, c2) in boxes.items():       # white text on a dark fill -> make it black on white
+        sub = gray[by0:by1, bx0:bx1]
+        if sub.size and sub.mean() < 115:
+            work[by0:by1, bx0:bx1] = 255 - work[by0:by1, bx0:bx1]
+    strips = work.copy()
+    words = []
+    for m, (bx0, by0, bx1, by1, r2, c2) in boxes.items():       # cells that span several columns: read separately
+        if c2 > m[1]:
+            words += _ix_strip_ocr(work, (bx0, by0, bx1, by1), lang, psm=6)
+            strips[by0:by1, bx0:bx1] = 255
+    for c in range(C):
+        words += _ix_strip_ocr(strips, (vl[c] + 2, t['y0'], vl[c + 1] - 2, t['y1']), lang, psm=6)
+    return words, work
+
+# ----------------------------------------------------------- main
+def image_to_items(path, lang='auto', mode='auto'):
+    """-> (items for _px_layout, page_width, report)"""
+    import cv2, numpy as np
+    lang_s = _ix_langs(lang)
+    gray = _ix_load(path)
+    gray, turned = _ix_orient(gray)
+    gray, angle = _ix_deskew(gray)
+    h, w = gray.shape
+    rep = {'lang': lang_s, 'angle': round(angle, 2), 'turned': turned, 'tables': 0, 'mode': 'layout', 'words': 0, 'conf': 0, 'warnings': []}
+    tables, horiz, vert, mask = ([], None, None, None) if mode == 'text' else _ix_find_tables(gray)
+    clean = gray.copy()
+    if mask is not None and tables:                     # erase the drawn lines (fill with the surrounding colour) so OCR does not read them as letters
+        clean = cv2.inpaint(gray, cv2.dilate(mask, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))), 3, cv2.INPAINT_TELEA)
+    page_words = _ix_ocr_words(clean, lang_s, psm=6)
+    if not page_words:
+        page_words = _ix_ocr_words(clean, lang_s, psm=11)
+    if not page_words and not tables:
+        raise ValueError('No text could be read from this image. Use a clearer, straighter photo.')
+    words = list(page_words)
+    items, used = [], set()
+    table_word_count = 0
+    if tables and mode != 'text':
+        rep['mode'] = 'grid'
+        import bisect
+        outside = []
+        for wd in page_words:            # page words that are not inside a table box stay normal text
+            cx, cy = (wd['x0'] + wd['x1']) / 2.0, (wd['top'] + wd['bottom']) / 2.0
+            if not any(t['x0'] - 4 <= cx <= t['x1'] + 4 and t['y0'] - 4 <= cy <= t['y1'] + 4 for t in tables):
+                outside.append(wd)
+        words = list(outside)
+        table_word_count = 0
+        for t in tables:
+            master, merges = _ix_merge_cells(t, horiz, vert)
+            hl, vl = t['hl'], t['vl']
+            R, C = len(hl) - 1, len(vl) - 1
+            tw, work = _ix_table_words(clean, gray, t, master, merges, lang_s)
+            table_word_count += len(tw)
+            def assign(ws_):
+                cw = {}
+                for wd in ws_:
+                    cx, cy = (wd['x0'] + wd['x1']) / 2.0, (wd['top'] + wd['bottom']) / 2.0
+                    if not (t['x0'] - 4 <= cx <= t['x1'] + 4 and t['y0'] - 4 <= cy <= t['y1'] + 4):
+                        continue
+                    c = min(C - 1, max(0, bisect.bisect_right(vl, cx) - 1)); r = min(R - 1, max(0, bisect.bisect_right(hl, cy) - 1))
+                    cw.setdefault(master[(r, c)], []).append(wd)
+                return cw
+            cell_words = assign(tw)
+            matrix = [[''] * C for _ in range(R)]
+            for (r, c), m in master.items():
+                if m == (r, c):
+                    matrix[r][c] = _ix_cell_text(cell_words.get(m, []))
+            fd = 1                                  # first data row (rows above are title / header)
+            for r in range(R):
+                if sum(1 for c in range(C) if master[(r, c)] == (r, c) and matrix[r][c] and _IX_NUMLIKE.match(matrix[r][c])) >= 2:
+                    fd = max(1, r); break
+            # columns that are mostly numbers: read again with digits only (fixes 1 -> a, 5 -> S ...)
+            for c in range(C):
+                body = [matrix[r][c] for r in range(fd, R) if master[(r, c)] == (r, c) and matrix[r][c]]
+                if len(body) >= 3 and sum(1 for x in body if _IX_NUMLIKE.match(x)) >= 0.6 * len(body):
+                    nw = _ix_strip_ocr(work, (vl[c] + 2, t['y0'], vl[c + 1] - 2, t['y1']), lang_s, psm=6, whitelist='0123456789.,-()%')
+                    ncw = assign(nw)
+                    for (r, cc), m in master.items():
+                        if cc == c and m == (r, cc) and r >= fd:
+                            new_t = _ix_cell_text(ncw.get(m, []))
+                            if new_t and not _IX_NUMLIKE.match(matrix[r][c] or 'x') :
+                                matrix[r][c] = new_t
+            # cells that are empty although they contain ink, or that were read with low confidence: look at them one by one
+            numeric_cols = set()
+            for c in range(C):
+                body = [matrix[r][c] for r in range(fd, R) if master[(r, c)] == (r, c) and matrix[r][c]]
+                if len(body) >= 3 and sum(1 for x in body if _IX_NUMLIKE.match(x)) >= 0.6 * len(body):
+                    numeric_cols.add(c)
+            reocr = 0
+            for (r, c), m in sorted(master.items()):
+                if m != (r, c) or reocr >= 45:
+                    continue
+                words_here = cell_words.get(m, [])
+                conf = (sum(w['conf'] for w in words_here) / len(words_here)) if words_here else 0.0
+                txt = matrix[r][c]
+                wrong_type = (c in numeric_cols and r >= fd and txt and not _IX_NUMLIKE.match(txt))
+                r2 = max(rr for (rr, cc), mm in master.items() if mm == m); c2 = max(cc for (rr, cc), mm in master.items() if mm == m)
+                box = (vl[c] + 3, hl[r] + 3, vl[c2 + 1] - 3, hl[r2 + 1] - 3)
+                sub = work[max(0, int(box[1])):int(box[3]), max(0, int(box[0])):int(box[2])]
+                has_ink = bool(sub.size and ((sub < 140).mean() > 0.02))
+                dark = bool(gray[max(0, int(box[1])):int(box[3]), max(0, int(box[0])):int(box[2])].size and gray[max(0, int(box[1])):int(box[3]), max(0, int(box[0])):int(box[2])].mean() < 115)
+                if (not txt and has_ink) or (txt and conf < (90 if dark else 78)) or wrong_type:
+                    reocr += 1
+                    digits = (c in numeric_cols and r >= fd)
+                    new_t, new_c = _ix_reocr_cell(work, box, lang_s, digits=digits)
+                    if new_t and (not txt or new_c > conf or wrong_type):
+                        matrix[r][c] = new_t
+            # serial-number columns (1, 2, 3 ...): if most cells follow the sequence, fix the ones OCR missed
+            for c in range(min(2, C)):               # serial numbers are in one of the first two columns
+                data_rows = [r for r in range(fd, R) if master[(r, c)] == (r, c)]
+                if len(data_rows) < 5:
+                    continue
+                vals = {}
+                for r in data_rows:
+                    tx = (matrix[r][c] or '').strip()
+                    if tx.isdigit() and len(tx) <= 3:
+                        vals[r] = int(tx)
+                if len(vals) < max(3, 0.4 * len(data_rows)):
+                    continue
+                offs = {}
+                for r, v in vals.items():
+                    offs[v - (r - fd)] = offs.get(v - (r - fd), 0) + 1
+                off, cnt = max(offs.items(), key=lambda kv: kv[1])
+                if cnt >= max(3, 0.4 * len(data_rows)) and 0 <= off <= 1 and max(vals.values()) < 1000:
+                    for r in data_rows:
+                        if any(w['size'] for w in cell_words.get(master[(r, c)], [])) or (matrix[r][c] or '') or any(matrix[r][k] for k in range(C) if k != c):
+                            matrix[r][c] = str(r - fd + off)
+            while matrix and not any(matrix[-1]): matrix.pop()
+            R2 = len(matrix)
+            keep_cols = [c for c in range(C) if any(matrix[r][c] for r in range(R2)) or any(m[1] <= c <= m[3] and m[0] < R2 for m in merges)]
+            if R2 < 1 or not keep_cols:
+                continue
+            remap = {c: i for i, c in enumerate(keep_cols)}
+            matrix = [[row[c] for c in keep_cols] for row in matrix]
+            mg = []
+            for (r1, c1, r2, c2) in merges:
+                if r1 >= R2: continue
+                cc = [remap[c] for c in range(c1, c2 + 1) if c in remap]
+                if cc and (len(cc) > 1 or min(r2, R2 - 1) > r1):
+                    mg.append((r1, min(cc), min(r2, R2 - 1), max(cc)))
+            items.append(('table', float(t['y0']), float(t['y1']), matrix, mg))
+            rep['tables'] += 1
+        if not rep['tables']:
+            rep['mode'] = 'layout'; words = list(page_words)
+    if not words and not items:
+        raise ValueError('No text could be read from this image. Use a clearer, straighter photo.')
+    rep['words'] = len(words) + (table_word_count if rep['mode'] == 'grid' else 0)
+    allw = page_words or words
+    rep['conf'] = round(sum(x['conf'] for x in allw) / len(allw)) if allw else 0
+    if rep['conf'] < 55:
+        rep['warnings'].append('Image is blurry or low quality - result may have mistakes. A clearer photo gives a better result.')
+    rest = [wd for wd in words]
+    if rest:
+        from_lines = _px_words_to_lines(rest, gap_k=0.95, gap_min=8.0)
+        items += [('line', l) for l in from_lines]
+    items.sort(key=lambda it: it[1] if it[0] == 'table' else it[1].top)
+    return items, float(w), rep
+
+def ix_fill_sheet(ws, path, lang='auto', mode='auto', numbers=True):
+    items, W, rep = image_to_items(path, lang, mode)
+    sizes = sorted(it[1].size for it in items if it[0] == 'line') or [20.0]
+    tol = max(2.0, 0.15 * sizes[len(sizes) // 2])
+    rows = _px_layout(items, W, tol)
+    _px_write(ws, rows, numbers, wrap=True)
+    return rep
+
+
+# ========== 22. IMAGE TO EXCEL (OCR + real table detection, no AI service) ==========
+def _ix_sheet_title(name, used):
+    base = re.sub(r'[\[\]\*\?/\\:]', '_', os.path.splitext(name or '')[0]).strip()[:28] or 'Sheet'
+    title, n = base, 2
+    while title.lower() in used:
+        title = '%s_%d' % (base[:25], n); n += 1
+    used.add(title.lower())
+    return title
+
+def _ix_preview(ws, max_rows=80, max_cols=16):
+    rows, merges = [], []
+    last_r = min(ws.max_row, max_rows)
+    max_cols = max(1, min(ws.max_column, max_cols))
+    for r in ws.iter_rows(min_row=1, max_row=last_r, max_col=max_cols):
+        vals = []
+        for c in r:
+            vals.append(_display_text(c.value, c.number_format)[0] if c.value is not None else '')
+        while vals and vals[-1] == '':
+            vals.pop()
+        rows.append(vals)
+    for rng in ws.merged_cells.ranges:
+        if rng.min_row <= last_r and rng.min_col <= max_cols:
+            merges.append([rng.min_row - 1, rng.min_col - 1, min(rng.max_row, last_r) - 1, min(rng.max_col, max_cols) - 1])
+    return rows, merges
+
 @app.route('/image-to-excel', methods=['POST'])
 def image_to_excel():
     if not processing_lock.acquire(timeout=300):
         return 'Server busy. Try again.', 503
     temp_dir = tempfile.mkdtemp()
     try:
-        if 'files' in request.files:
-            files = request.files.getlist('files')
-        elif 'file' in request.files:
-            files = [request.files['file']]
-        else:
-            return 'No files uploaded', 400
+        files = request.files.getlist('files') or ([request.files['file']] if 'file' in request.files else [])
         files = [f for f in files if f and f.filename]
-        if not files: return 'No files uploaded', 400
-        if len(files) > 3: return 'Max 3 files allowed per request', 400
-        from google import genai
-        from PIL import Image
-        import json
+        if not files:
+            return 'No images uploaded', 400
+        if len(files) > 5:
+            return 'Maximum 5 images at a time', 400
+        lang = (request.form.get('lang', 'auto') or 'auto').lower()
+        mode = (request.form.get('mode', 'auto') or 'auto').lower()
+        mode = mode if mode in ('auto', 'text') else 'auto'          # 'text' = ignore borders
+        numbers = _flag(request.form.get('numbers'), True)
+        fmt = (request.form.get('format', 'xlsx') or 'xlsx').lower()
+        saved = []
+        for i, f in enumerate(files):
+            valid, msg = validate_file(f, allowed_ext=['.jpg', '.jpeg', '.png', '.webp', '.bmp', '.tiff', '.tif'], max_size=15 * 1024 * 1024)
+            if not valid:
+                return '%s: %s' % (f.filename, msg), 400
+            p = os.path.join(temp_dir, 'img_%d%s' % (i, os.path.splitext(f.filename)[1].lower()))
+            f.save(p)
+            saved.append((f.filename, p))
+        try:
+            import pytesseract
+            pytesseract.get_tesseract_version()
+        except Exception:
+            return 'OCR engine (Tesseract) is not available on the server.', 500
         from openpyxl import Workbook
-        from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-        from openpyxl.utils import get_column_letter
-        from datetime import datetime
-        api_key = os.environ.get('GEMINI_API_KEY', '').strip()
-        if not api_key: return 'Server not configured. Contact admin.', 500
-        client = genai.Client(api_key=api_key)
-        prompt_text = """Extract ALL table data from this image.
-Return ONLY valid JSON, no explanation, no markdown:
-{"tables":[{"name":"Table 1","rows":[["cell1","cell2"],["cell3","cell4"]]}]}
-Rules:
-- Preserve EXACT text including Hindi/Devanagari
-- Each row is array of cell strings, keep same column count
-- If multiple tables, return multiple objects
-- If no table, treat whole content as one table
-- Empty cells = ""
-- Return ONLY JSON, nothing else"""
-        results = []
-        for idx, file in enumerate(files):
-            valid, msg = validate_file(file, allowed_ext=['.jpg', '.jpeg', '.png', '.webp', '.bmp', '.tiff', '.tif'], max_size=15 * 1024 * 1024)
-            if not valid: return f'File {idx+1} ({file.filename}): {msg}', 400
-            ext = os.path.splitext(file.filename)[1].lower() or '.png'
-            input_path = os.path.join(temp_dir, f'input_{idx}{ext}')
-            file.save(input_path)
+        from flask import jsonify
+        import base64 as _b64
+
+        def convert(name, path, wb, used):
+            ws = wb.create_sheet(_ix_sheet_title(name, used))
             try:
-                img = Image.open(input_path)
-                if img.mode != 'RGB': img = img.convert('RGB')
-                max_dim = 2000
-                if max(img.size) > max_dim:
-                    ratio = max_dim / max(img.size)
-                    img = img.resize((int(img.width * ratio), int(img.height * ratio)), Image.LANCZOS)
-                text, model_used = generate_gemini_response(client, prompt_text, img, file.filename)
-                print(f'✅ Used model: {model_used}', flush=True)
-                if text.startswith('```'):
-                    parts = text.split('```')
-                    text = parts[1] if len(parts) > 1 else text
-                    if text.startswith('json'): text = text[4:]
-                text = text.strip()
-                try: data = json.loads(text)
-                except: return f'AI could not parse {file.filename}.', 400
-                tables = data.get('tables', [])
-                if not tables: return f'No table data found in {file.filename}.', 400
-                wb = Workbook()
-                ws = wb.active
-                ws.title = 'Extracted Data'
-                thin = Border(left=Side(style='thin', color='CCCCCC'), right=Side(style='thin', color='CCCCCC'), top=Side(style='thin', color='CCCCCC'), bottom=Side(style='thin', color='CCCCCC'))
-                current_row = 1
-                for t_idx, table_data in enumerate(tables):
-                    rows = table_data.get('rows', [])
-                    if not rows: continue
-                    cols = max(len(r) for r in rows) if rows else 0
-                    if cols == 0: continue
-                    if len(tables) > 1:
-                        title_cell = ws.cell(row=current_row, column=1, value=f'📄 {table_data.get("name", f"Table {t_idx+1}")}')
-                        title_cell.font = Font(bold=True, size=12, color='FFFFFF')
-                        title_cell.fill = PatternFill('solid', fgColor='A855F7')
-                        ws.merge_cells(start_row=current_row, start_column=1, end_row=current_row, end_column=max(cols, 3))
-                        current_row += 2
-                    data_start = current_row
-                    for r_idx, row in enumerate(rows):
-                        for c_idx in range(cols):
-                            val = row[c_idx] if c_idx < len(row) else ''
-                            cell = ws.cell(row=data_start + r_idx, column=c_idx + 1, value=str(val))
-                            cell.alignment = Alignment(wrap_text=True, vertical='center')
-                            cell.border = thin
-                            if r_idx == 0:
-                                cell.font = Font(bold=True, color='FFFFFF', size=11)
-                                cell.fill = PatternFill('solid', fgColor='A855F7')
-                            elif r_idx % 2 == 0:
-                                cell.fill = PatternFill('solid', fgColor='F8F5FF')
-                    for c_idx in range(cols):
-                        col_letter = get_column_letter(c_idx + 1)
-                        max_len = 12
-                        for r_idx in range(len(rows)):
-                            if c_idx < len(rows[r_idx]):
-                                max_len = max(max_len, min(len(str(rows[r_idx][c_idx])), 55))
-                        ws.column_dimensions[col_letter].width = max_len
-                    current_row = data_start + len(rows) + 2
-                base_name = os.path.splitext(file.filename)[0]
-                base_name = re.sub(r'[\\/\*\?\:\[\]<>|]', '_', base_name)[:50] or f'file_{idx+1}'
-                output_path = os.path.join(temp_dir, f'output_{idx}.xlsx')
-                wb.save(output_path)
-                results.append((base_name, output_path))
-                print(f'✅ {file.filename} done', flush=True)
+                return ws, ix_fill_sheet(ws, path, lang, mode, numbers), None
+            except ValueError as e:
+                wb.remove(ws)
+                return None, None, '%s: %s' % (name, e)
             except Exception as e:
                 import traceback
                 traceback.print_exc()
-                return f'AI Error ({file.filename}): {str(e)[:300]}', 500
-        if not results: return 'No table data extracted from any file.', 400
+                wb.remove(ws)
+                return None, None, '%s: could not read this image.' % name
+
+        if fmt == 'json':
+            wb = Workbook(); wb.remove(wb.active); used = set(); sheets, errors = [], []
+            for name, path in saved:
+                ws, rep, err = convert(name, path, wb, used)
+                if err:
+                    errors.append(err); continue
+                total_rows, total_cols = ws.max_row, ws.max_column
+                rows, merges = _ix_preview(ws)
+                first_merge = next((m for m in merges if m[0] == 0 and m[3] - m[1] >= 2), None)
+                sheets.append({'name': ws.title, 'file': name, 'rows': rows, 'merges': merges, 'header_rows': 2 if first_merge else 1,
+                               'total_rows': total_rows, 'total_cols': total_cols, 'mode': rep['mode'], 'tables': rep['tables'],
+                               'conf': rep['conf'], 'words': rep['words'], 'lang': rep['lang'], 'angle': rep['angle'], 'turned': rep.get('turned', 0), 'warnings': rep['warnings']})
+            if not sheets:
+                return ' | '.join(errors) or 'Could not read the images.', 400
+            out = os.path.join(temp_dir, 'out.xlsx'); wb.save(out)
+            with open(out, 'rb') as fh:
+                data = _b64.b64encode(fh.read()).decode('ascii')
+            return jsonify({'ok': True, 'sheets': sheets, 'errors': errors, 'xlsx_b64': data})
+
+        # classic response: one image -> .xlsx, several images -> .zip with one workbook per image
+        results = []
+        for name, path in saved:
+            wb = Workbook(); wb.remove(wb.active)
+            ws, rep, err = convert(name, path, wb, set())
+            if err:
+                return err, 400
+            out = os.path.join(temp_dir, 'out_%d.xlsx' % len(results)); wb.save(out)
+            results.append((os.path.splitext(name)[0] or 'image', out))
         if len(results) == 1:
-            base_name, output_path = results[0]
-            return send_file(output_path, mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', as_attachment=True, download_name=f'Bharat24Tools_AI_{base_name}.xlsx')
+            return send_file(results[0][1], mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                             as_attachment=True, download_name='%s.xlsx' % re.sub(r'[\\/\*\?\:"<>|]', '_', results[0][0])[:80])
         zip_buffer = io.BytesIO()
         with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
-            for base_name, path in results: zf.write(path, f'{base_name}.xlsx')
+            for i, (base, out) in enumerate(results, 1):
+                zf.write(out, '%d_%s.xlsx' % (i, re.sub(r'[\\/\*\?\:"<>|]', '_', base)[:60]))
         zip_buffer.seek(0)
-        return send_file(zip_buffer, mimetype='application/zip', as_attachment=True, download_name=f'Bharat24Tools_AI_{datetime.now().strftime("%Y%m%d_%H%M")}.zip')
+        return send_file(zip_buffer, mimetype='application/zip', as_attachment=True, download_name='Bharat24Tools_images_to_excel.zip')
     except Exception as e:
         import traceback
         traceback.print_exc()
