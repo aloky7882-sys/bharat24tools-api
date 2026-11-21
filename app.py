@@ -650,6 +650,7 @@ def compress():
     if not processing_lock.acquire(timeout=300):
         return 'Server busy. Try again.', 503
     temp_dir = tempfile.mkdtemp()
+    _keep = _keep_alive(temp_dir)
     try:
         if 'file' not in request.files:
             return 'No file uploaded', 400
@@ -716,6 +717,7 @@ def compress():
         traceback.print_exc()
         return f'Error: {str(e)}', 500
     finally:
+        _keep.set()
         processing_lock.release()
         cleanup_dir(temp_dir)
 
@@ -2111,6 +2113,7 @@ def excel_to_pdf():
     if not processing_lock.acquire(timeout=300):
         return 'Server busy. Try again.', 503
     temp_dir = tempfile.mkdtemp()
+    _keep = _keep_alive(temp_dir)
     try:
         if 'file' not in request.files:
             return 'No file uploaded', 400
@@ -2152,6 +2155,7 @@ def excel_to_pdf():
         traceback.print_exc()
         return f'Error: {str(e)}', 500
     finally:
+        _keep.set()
         processing_lock.release()
         cleanup_dir(temp_dir)
 
@@ -2534,6 +2538,7 @@ def pdf_to_excel():
     if not processing_lock.acquire(timeout=300):
         return 'Server busy. Try again.', 503
     temp_dir = tempfile.mkdtemp()
+    _keep = _keep_alive(temp_dir)
     try:
         if 'file' not in request.files:
             return 'No file uploaded', 400
@@ -2566,6 +2571,7 @@ def pdf_to_excel():
         traceback.print_exc()
         return f'Error: {str(e)}', 500
     finally:
+        _keep.set()
         processing_lock.release()
         cleanup_dir(temp_dir)
 
@@ -3277,6 +3283,67 @@ Rules:
         processing_lock.release()
         cleanup_dir(temp_dir)
 
+
+# ----------------------------------------------------------------------
+#  Keeps a job's temp folder "fresh". The cleanup sweepers at the top of this file delete any
+#  /tmp/tmp* folder that has not changed for 60-120 s - a long OCR / compression job must not be
+#  deleted while it is still running.
+# ----------------------------------------------------------------------
+def _keep_alive(path):
+    stop = threading.Event()
+    def beat():
+        while not stop.wait(5):
+            try:
+                os.utime(path, None)
+            except Exception:
+                return
+    threading.Thread(target=beat, daemon=True).start()
+    return stop
+
+_IX_JOBS = '/tmp/b24jobs'          # not matched by the /tmp/tmp* sweepers; cleaned by _ix_jobs_sweep()
+
+def _ix_jobs_sweep(max_age=1800):
+    try:
+        now = time.time()
+        for d in glob.glob(os.path.join(_IX_JOBS, '*')):
+            try:
+                if os.path.getmtime(d) < now - max_age:
+                    shutil.rmtree(d, ignore_errors=True)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+def _ix_job_dir(job, create=False):
+    if not re.fullmatch(r'[A-Za-z0-9_-]{8,64}', job or ''):
+        return None
+    d = os.path.join(_IX_JOBS, job)
+    if create:
+        os.makedirs(d, exist_ok=True)
+    return d if os.path.isdir(d) else None
+
+def _ix_rows_dump(rows):
+    out = []
+    for r in rows:
+        out.append({'cells': [[c, t, bool(b)] for c, (t, b) in r['cells'].items()], 'merges': [list(m) for m in r['merges']], 'kind': r['kind'],
+                    'hdr': bool(r['hdr']), 'blank': bool(r['blank']), 'size': float(r['size']),
+                    'tbl_merges': [list(m) for m in r['tbl_merges']] if r.get('tbl_merges') else None})
+    return out
+
+def _ix_rows_load(data):
+    rows = []
+    for r in data:
+        rows.append({'cells': {int(c): (t, bool(b)) for c, t, b in r['cells']}, 'merges': [tuple(m) for m in r['merges']], 'kind': r['kind'],
+                     'hdr': r['hdr'], 'blank': r['blank'], 'size': r['size'],
+                     'tbl_merges': [tuple(m) for m in r['tbl_merges']] if r.get('tbl_merges') else None})
+    return rows
+
+def ix_process(path, lang='auto', mode='auto'):
+    items, W, rep = image_to_items(path, lang, mode)
+    sizes = sorted(it[1].size for it in items if it[0] == 'line') or [20.0]
+    tol = max(2.0, 0.15 * sizes[len(sizes) // 2])
+    return _px_layout(items, W, tol), rep
+
 # ======================================================================
 #  IMAGE -> EXCEL ENGINE (uses the layout helpers above)
 # ======================================================================
@@ -3322,8 +3389,8 @@ def _ix_load(path):
     if long_side < 1800:                       # small screenshots: enlarge so small text becomes readable
         f = min(3.0, 2000.0 / long_side)
         im = im.resize((int(w * f), int(h * f)), Image.LANCZOS)
-    elif long_side > 4200:
-        f = 4200.0 / long_side
+    elif long_side > 3200:
+        f = 3200.0 / long_side
         im = im.resize((int(w * f), int(h * f)), Image.LANCZOS)
     return np.array(im)
 
@@ -3712,10 +3779,7 @@ def image_to_items(path, lang='auto', mode='auto'):
     return items, float(w), rep
 
 def ix_fill_sheet(ws, path, lang='auto', mode='auto', numbers=True):
-    items, W, rep = image_to_items(path, lang, mode)
-    sizes = sorted(it[1].size for it in items if it[0] == 'line') or [20.0]
-    tol = max(2.0, 0.15 * sizes[len(sizes) // 2])
-    rows = _px_layout(items, W, tol)
+    rows, rep = ix_process(path, lang, mode)
     _px_write(ws, rows, numbers, wrap=True)
     return rep
 
@@ -3750,18 +3814,20 @@ def image_to_excel():
     if not processing_lock.acquire(timeout=300):
         return 'Server busy. Try again.', 503
     temp_dir = tempfile.mkdtemp()
+    _keep = _keep_alive(temp_dir)
     try:
         files = request.files.getlist('files') or ([request.files['file']] if 'file' in request.files else [])
         files = [f for f in files if f and f.filename]
         if not files:
             return 'No images uploaded', 400
         if len(files) > 5:
-            return 'Maximum 5 images at a time', 400
+            return 'Maximum 5 images in one request', 400
         lang = (request.form.get('lang', 'auto') or 'auto').lower()
         mode = (request.form.get('mode', 'auto') or 'auto').lower()
         mode = mode if mode in ('auto', 'text') else 'auto'          # 'text' = ignore borders
         numbers = _flag(request.form.get('numbers'), True)
         fmt = (request.form.get('format', 'xlsx') or 'xlsx').lower()
+        job = request.form.get('job', '')
         saved = []
         for i, f in enumerate(files):
             valid, msg = validate_file(f, allowed_ext=['.jpg', '.jpeg', '.png', '.webp', '.bmp', '.tiff', '.tif'], max_size=15 * 1024 * 1024)
@@ -3778,32 +3844,40 @@ def image_to_excel():
         from openpyxl import Workbook
         from flask import jsonify
         import base64 as _b64
+        import json as _json
 
-        def convert(name, path, wb, used):
-            ws = wb.create_sheet(_ix_sheet_title(name, used))
+        def convert(name, path):
             try:
-                return ws, ix_fill_sheet(ws, path, lang, mode, numbers), None
+                rows, rep = ix_process(path, lang, mode)
+                return rows, rep, None
             except ValueError as e:
-                wb.remove(ws)
                 return None, None, '%s: %s' % (name, e)
-            except Exception as e:
+            except Exception:
                 import traceback
                 traceback.print_exc()
-                wb.remove(ws)
                 return None, None, '%s: could not read this image.' % name
 
         if fmt == 'json':
             wb = Workbook(); wb.remove(wb.active); used = set(); sheets, errors = [], []
             for name, path in saved:
-                ws, rep, err = convert(name, path, wb, used)
+                rows, rep, err = convert(name, path)
                 if err:
                     errors.append(err); continue
+                ws = wb.create_sheet(_ix_sheet_title(name, used))
+                _px_write(ws, rows, numbers, wrap=True)
                 total_rows, total_cols = ws.max_row, ws.max_column
-                rows, merges = _ix_preview(ws)
+                prev_rows, merges = _ix_preview(ws)
                 first_merge = next((m for m in merges if m[0] == 0 and m[3] - m[1] >= 2), None)
-                sheets.append({'name': ws.title, 'file': name, 'rows': rows, 'merges': merges, 'header_rows': 2 if first_merge else 1,
+                sheets.append({'name': ws.title, 'file': name, 'rows': prev_rows, 'merges': merges, 'header_rows': 2 if first_merge else 1,
                                'total_rows': total_rows, 'total_cols': total_cols, 'mode': rep['mode'], 'tables': rep['tables'],
                                'conf': rep['conf'], 'words': rep['words'], 'lang': rep['lang'], 'angle': rep['angle'], 'turned': rep.get('turned', 0), 'warnings': rep['warnings']})
+                if _ix_job_dir(job) is None and re.fullmatch(r'[A-Za-z0-9_-]{8,64}', job or ''):
+                    _ix_jobs_sweep(); _ix_job_dir(job, create=True)
+                jd = _ix_job_dir(job)
+                part = request.form.get('part', '')
+                if jd and part.isdigit():                     # remember this image so all images can be merged into ONE workbook
+                    with open(os.path.join(jd, 'part_%s.json' % part), 'w', encoding='utf-8') as fh:
+                        _json.dump({'name': name, 'numbers': numbers, 'rows': _ix_rows_dump(rows)}, fh)
             if not sheets:
                 return ' | '.join(errors) or 'Could not read the images.', 400
             out = os.path.join(temp_dir, 'out.xlsx'); wb.save(out)
@@ -3814,10 +3888,12 @@ def image_to_excel():
         # classic response: one image -> .xlsx, several images -> .zip with one workbook per image
         results = []
         for name, path in saved:
-            wb = Workbook(); wb.remove(wb.active)
-            ws, rep, err = convert(name, path, wb, set())
+            rows, rep, err = convert(name, path)
             if err:
                 return err, 400
+            wb = Workbook(); wb.remove(wb.active)
+            ws = wb.create_sheet(_ix_sheet_title(name, set()))
+            _px_write(ws, rows, numbers, wrap=True)
             out = os.path.join(temp_dir, 'out_%d.xlsx' % len(results)); wb.save(out)
             results.append((os.path.splitext(name)[0] or 'image', out))
         if len(results) == 1:
@@ -3834,8 +3910,37 @@ def image_to_excel():
         traceback.print_exc()
         return f'Error: {str(e)}', 500
     finally:
+        _keep.set()
         processing_lock.release()
         cleanup_dir(temp_dir)
+
+
+@app.route('/image-to-excel/merge', methods=['POST'])
+def image_to_excel_merge():
+    """Joins the images converted one by one (same job id) into a single Excel file, one sheet per image."""
+    import json as _json
+    from openpyxl import Workbook
+    jd = _ix_job_dir(request.form.get('job', ''))
+    if not jd:
+        return 'This session has expired. Please convert the images again.', 410
+    order = [int(x) for x in (request.form.get('parts', '') or '').split(',') if x.strip().isdigit()][:10]
+    wb = Workbook(); wb.remove(wb.active); used = set(); n = 0
+    for part in order:
+        fp = os.path.join(jd, 'part_%d.json' % part)
+        if not os.path.exists(fp):
+            continue
+        with open(fp, 'r', encoding='utf-8') as fh:
+            data = _json.load(fh)
+        ws = wb.create_sheet(_ix_sheet_title(data.get('name', 'Sheet'), used))
+        _px_write(ws, _ix_rows_load(data['rows']), data.get('numbers', True), wrap=True)
+        n += 1
+    if not n:
+        return 'Nothing to merge.', 400
+    out = os.path.join(jd, 'merged_%d.xlsx' % int(time.time()))
+    wb.save(out)
+    resp = send_file(out, mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', as_attachment=True, download_name='images-to-excel.xlsx')
+    cleanup_dir(jd, delay=120)
+    return resp
 
 # ========== 23. PDF WATERMARK ==========
 @app.route('/pdf-watermark', methods=['POST'])
